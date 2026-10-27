@@ -1,0 +1,40 @@
+{
+  "name": "omp-config-crypt",
+  "version": "0.6.3",
+  "description": "Universal cross-platform encrypted portability for omp config, extensions, and instructions",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "omp-sync": "./bin/omp-sync.js"
+  },
+  "scripts": {
+    "test": "node test/sync-portable.test.mjs"
+  },
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "plugin",
+    "config",
+    "sync",
+    "encryption",
+    "cross-platform",
+    "portable"
+  ],
+  "files": [
+    "index.js",
+    "src",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "omp": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}
