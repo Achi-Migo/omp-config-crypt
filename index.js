@@ -111,6 +111,7 @@ import {
 import {
   inventoryResources,
   readResource,
+  canonicalResourceValue,
   sanitizeResourceForExport,
   restoreResourceForImport,
   HOME_PLACEHOLDER,
@@ -356,12 +357,10 @@ export function adaptArchive(blob, pass) {
 }
 
 /**
- * Installs the missing or mismatched plugin dependencies a sync plan blocked on.
- * Versions come from the plan action value when present (internal/hand-built plans);
- * public plans sanitize action values away, so the snapshot payload is consulted as
- * fallback. Skipped entries keep their blocked state and surface as apply errors.
+ * Installs exact plugin package versions through npm (or an injected installer).
+ * Returns the fixed "name@version" entries plus names skipped for missing versions.
  */
-export function fixPluginPrerequisites(plan, root, { install, payload = null } = {}) {
+function installPluginPackages(entries, root, install) {
   const npmCmd = resolveNpmCommand();
   const doInstall = install ?? ((name, version) => {
     execFileSync(
@@ -370,14 +369,9 @@ export function fixPluginPrerequisites(plan, root, { install, payload = null } =
       { stdio: "pipe", shell: npmCmd.shell },
     );
   });
-  const payloadVersions = new Map((payload?.resources || []).map((resource) => [resource.id, resource.value]));
   const fixed = [];
   const skipped = [];
-  for (const action of plan.actions || []) {
-    if (action.action !== "blocked" || !String(action.id || "").startsWith("plugin:")) continue;
-    if (action.reason !== "plugin-not-installed" && action.reason !== "plugin-version-mismatch") continue;
-    const name = action.id.slice("plugin:".length);
-    const version = action.value?.version ?? payloadVersions.get(action.id)?.version ?? null;
+  for (const { name, version } of entries) {
     if (!version) {
       skipped.push(name);
       continue;
@@ -390,6 +384,52 @@ export function fixPluginPrerequisites(plan, root, { install, payload = null } =
     fixed.push(`${name}@${version}`);
   }
   return { fixed, skipped };
+}
+
+/**
+ * Installs remote-declared plugins whose local declaration can no longer be
+ * canonicalized — a range dependency (e.g. "^0.1.2") whose node_modules vanished
+ * makes planSync throw before the blocked-plugin path can trigger. Restoring the
+ * exact remote version first keeps the plan buildable.
+ */
+export function repairUnreadablePlugins(payload, root, { install } = {}) {
+  const entries = [];
+  for (const resource of payload?.resources || []) {
+    const id = String(resource?.id || "");
+    if (!id.startsWith("plugin:")) continue;
+    const version = resource.value?.version;
+    if (!version) continue;
+    let local = null;
+    try {
+      local = readResource(root, id);
+    } catch { local = null; }
+    if (!local) continue;
+    try {
+      canonicalResourceValue(id, local.value, root);
+    } catch {
+      entries.push({ name: id.slice("plugin:".length), version });
+    }
+  }
+  return installPluginPackages(entries, root, install).fixed;
+}
+
+/**
+ * Installs the missing or mismatched plugin dependencies a sync plan blocked on.
+ * Versions come from the plan action value when present (internal/hand-built plans);
+ * public plans sanitize action values away, so the snapshot payload is consulted as
+ * fallback. Skipped entries keep their blocked state and surface as apply errors.
+ */
+export function fixPluginPrerequisites(plan, root, { install, payload = null } = {}) {
+  const payloadVersions = new Map((payload?.resources || []).map((resource) => [resource.id, resource.value]));
+  const entries = [];
+  for (const action of plan.actions || []) {
+    if (action.action !== "blocked" || !String(action.id || "").startsWith("plugin:")) continue;
+    if (action.reason !== "plugin-not-installed" && action.reason !== "plugin-version-mismatch") continue;
+    const name = action.id.slice("plugin:".length);
+    const version = action.value?.version ?? payloadVersions.get(action.id)?.version ?? null;
+    entries.push({ name, version });
+  }
+  return installPluginPackages(entries, root, install);
 }
 
 /**
@@ -415,10 +455,17 @@ export function restoreArchive(blob, pass, root = configRoot(), options = {}) {
   }
 
   const dryRun = Boolean(options.dryRun);
+
+  // Self-healing stage 1: repair local plugin declarations that would break planning
+  // (range dependency with a vanished install). Must run before planSync.
+  if (!dryRun && options.autoFixPlugins !== false) {
+    repairUnreadablePlugins(effectivePayload, root, { install: options.installFn });
+  }
+
   let plan = planSync(effectivePayload, root, { strategy: options.strategy });
 
-  // Self-healing: install plugin dependencies the plan blocked on, then replan once
-  // (the install mutates the plugins tree, so the original plan is stale). Remaining
+  // Self-healing stage 2: install plugin dependencies the plan blocked on, then replan
+  // once (the install mutates the plugins tree, so the original plan is stale). Remaining
   // blocked actions still fail the apply.
   if (!dryRun && plan.prerequisites.length > 0 && options.autoFixPlugins !== false) {
     const fx = fixPluginPrerequisites(plan, root, { install: options.installFn, payload: effectivePayload });

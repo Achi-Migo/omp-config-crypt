@@ -3442,3 +3442,39 @@ test("61. restoreArchive auto-installs missing plugin dependencies and applies a
   const state = readSyncState(env.b.agent);
   assert.ok(state.resources["plugin:demo"]);
 });
+
+test("62. restoreArchive repairs a range-declared plugin whose node_modules vanished", async (t) => {
+  const env = makeTempEnv("omp-plugin-range-heal-");
+  t.after(env.cleanup);
+
+  fs.writeFileSync(path.join(env.a.plugins, "package.json"), JSON.stringify({ dependencies: { demo: "1.2.3" } }));
+  installPlugin(env.a, "demo", "1.2.3");
+  await setResourceScope(env.a.agent, "plugin:demo", "public");
+  const { blob } = buildArchive(TEST_PASS, env.a.agent);
+
+  // B declares the plugin via an npm range and its node_modules entry is gone:
+  // canonicalization would make planSync throw without the pre-plan repair.
+  fs.writeFileSync(path.join(env.b.plugins, "package.json"), JSON.stringify({ dependencies: { demo: "^1.2.3" } }));
+  fs.writeFileSync(
+    path.join(env.b.plugins, "omp-plugins.lock.json"),
+    JSON.stringify({ plugins: { demo: { version: "1.2.3", enabled: true } } }),
+  );
+
+  const installed = [];
+  const installFn = (name, version) => {
+    installed.push(`${name}@${version}`);
+    fs.mkdirSync(path.join(env.b.plugins, "node_modules", ...name.split("/")), { recursive: true });
+    fs.writeFileSync(path.join(env.b.plugins, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({ name, version }));
+  };
+
+  const res = restoreArchive(blob, TEST_PASS, env.b.agent, { installFn });
+  assert.deepEqual(installed, ["demo@1.2.3"]);
+  assert.equal(res.blocked.length, 0);
+  // Local declaration now canonicalizes identically to remote: adopted as baseline, no writes needed.
+  assert.equal(res.files, 0);
+  assert.ok(readSyncState(env.b.agent).resources["plugin:demo"]);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(env.b.plugins, "node_modules", "demo", "package.json"), "utf8")).version,
+    "1.2.3",
+  );
+});
