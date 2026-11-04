@@ -8,6 +8,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { parseDocument } from "yaml";
 
 export function getAgentDir(customRoot) {
   return customRoot || process.env.OMP_CFG_ROOT || path.join(os.homedir(), ".omp", "agent");
@@ -230,6 +231,27 @@ export function ensureLocalExtension(ompDir) {
  */
 export function parseYamlModels(str) {
   if (!str || typeof str !== "string") return {};
+  const providers = parseBlockYamlModels(str);
+  if (Object.keys(providers).length) return providers;
+  // Flow-style (brace/bracket) YAML: delegate to the yaml package.
+  return parseFlowYamlModels(str);
+}
+
+function parseFlowYamlModels(str) {
+  let doc;
+  try {
+    doc = parseDocument(str, { indent: true });
+    if (doc.errors.length) return {};
+  } catch {
+    return {};
+  }
+  const data = doc.toJS();
+  const providers = data && typeof data === "object" && !Array.isArray(data) ? data.providers : null;
+  if (!providers || typeof providers !== "object" || Array.isArray(providers)) return {};
+  return providers;
+}
+
+function parseBlockYamlModels(str) {
   const lines = str.split("\n");
   const providers = {};
   let curProvider = null;
@@ -555,26 +577,40 @@ function assertSupportedProviders(providers) {
 function assertPublicSource(agentDir) {
   const file = ["models.yml", "models.yaml"].map(name => path.join(agentDir, name)).find(name => fs.existsSync(name));
   if (!file) return;
-  // The fixed-field formatter cannot preserve arbitrary YAML. Reject unfamiliar structure.
-  let section = "", provider = "";
-  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
-    const text = line.trim();
-    if (!text || text.startsWith("#")) continue;
-    const indent = line.search(/\S/);
-    const field = text.replace(/^-\s*/, "").split(":")[0];
-    if (indent === 0 && text === "providers:") { section = "providers"; continue; }
-    if (indent === 2 && /^[A-Za-z0-9][A-Za-z0-9_-]*:$/.test(text)) { provider = field; section = "provider"; continue; }
-    if (provider && indent === 4 && PROVIDER_FIELDS.has(field)) {
-      section = field === "models" && text === "models:" ? "models" : "provider";
-      if (section === "provider" && field !== "apiKey" && !text.slice(text.indexOf(":") + 1).trim()) unsupported(`${provider}.${field}`);
-      continue;
-    }
-    if (section === "models" || section === "model" || section === "compat") {
-      if (indent === 6 && text.startsWith("- ") && field === "id") { section = "model"; continue; }
-      if (indent === 8 && MODEL_FIELDS.has(field)) { section = field === "compat" ? "compat" : "model"; continue; }
-      if (indent === 10 && section === "compat" && /^[A-Za-z0-9_-]+:\s*\S/.test(text)) continue;
-    }
-    unsupported(`${provider || "root"}.${field}`);
+  const text = fs.readFileSync(file, "utf8");
+  // The fixed-field formatter cannot preserve arbitrary YAML. Reject unfamiliar structure,
+  // unless the yaml package can parse it into the providers mapping (the next write
+  // re-serializes everything in canonical block style anyway).
+  try {
+    scanBlockSource(text);
+  } catch (blockError) {
+    if (!parseFlowYamlModels(text) || !Object.keys(parseFlowYamlModels(text)).length) throw blockError;
+    assertSupportedProviders(parseFlowYamlModels(text));
+    return;
   }
   assertSupportedProviders(readPublicProviders(agentDir));
 }
+function scanBlockSource(text) {
+  // The fixed-field formatter cannot preserve arbitrary YAML. Reject unfamiliar structure.
+  let section = "", provider = "";
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = line.search(/\S/);
+    const field = trimmed.replace(/^-\s*/, "").split(":")[0];
+    if (indent === 0 && trimmed === "providers:") { section = "providers"; continue; }
+    if (indent === 2 && /^[A-Za-z0-9][A-Za-z0-9_-]*:$/.test(trimmed)) { provider = field; section = "provider"; continue; }
+    if (provider && indent === 4 && PROVIDER_FIELDS.has(field)) {
+      section = field === "models" && trimmed === "models:" ? "models" : "provider";
+      if (section === "provider" && field !== "apiKey" && !trimmed.slice(trimmed.indexOf(":") + 1).trim()) unsupported(`${provider}.${field}`);
+      continue;
+    }
+    if (section === "models" || section === "model" || section === "compat") {
+      if (indent === 6 && trimmed.startsWith("- ") && field === "id") { section = "model"; continue; }
+      if (indent === 8 && MODEL_FIELDS.has(field)) { section = field === "compat" ? "compat" : "model"; continue; }
+      if (indent === 10 && section === "compat" && /^[A-Za-z0-9_-]+:\s*\S/.test(trimmed)) continue;
+    }
+    unsupported(`${provider || "root"}.${field}`);
+  }
+}
+
