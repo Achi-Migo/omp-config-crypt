@@ -71,7 +71,8 @@ async function verifyDraft(ctx, draft) {
 }
 const checkIdentity = config => JSON.stringify([config.api, config.baseUrl, config.apiKey || ""]);
 async function acquireDraftModels(ctx, draft, agentDir, seedIds = draft.config.models.map(model => model.id)) {
-  const acquired = await acquireProviderModels(ctx, { name: draft.name, config: draft.config, agentDir, seedIds });
+  const acquired = await acquireProviderModels(ctx, { name: draft.name, config: draft.config, agentDir, seedIds,
+    preservedIds: draft.config.models.map(model => model.id) });
   if (!acquired) return false;
   draft.config.models = acquired.models;
   draft.config.baseUrl = acquired.baseUrl;
@@ -173,7 +174,18 @@ async function editDraft(ctx, name, agentDir, supplied) {
     } else if (field === "存储范围") {
       const scope = await chooseScope(ctx);
       if (scope !== undefined) draft.isPrivate = scope;
-    } else if (field === "模型") await acquireDraftModels(ctx, draft, agentDir);
+    } else if (field === "模型") {
+      if (!draft.config.models.length) { await acquireDraftModels(ctx, draft, agentDir); continue; }
+      const operation = await select(ctx, `MODELS // ${name} · ${draft.config.models.length} 个已配置模型`,
+        ["保留已配置模型", "重新选择并测试模型", "返回"]);
+      if (operation === "保留已配置模型") {
+        // Default for edit: keep every configured model verified without re-testing.
+        draft.checks = new Map(draft.config.models.map(model => [model.id, { ok: true }]));
+        draft.checkIdentity = checkIdentity(draft.config);
+        draft.requireVerifiedModels = true;
+        ctx.ui.notify("已保留全部已配置模型，未重新测试", "info");
+      } else if (operation === "重新选择并测试模型") await acquireDraftModels(ctx, draft, agentDir);
+    }
     else if (field === "保存" && await saveSummary(ctx, draft, agentDir, false)) return;
   }
 }

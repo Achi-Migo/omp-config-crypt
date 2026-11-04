@@ -123,6 +123,11 @@ checked subset, Esc returns to source actions. Other/manual IDs also require gen
 Progress and model rows show full short-generation latency in milliseconds, including the final
 stream event. Esc during discovery or testing cancels acquisition. A supported native askDialog
 host is required. The local registry is read without refreshing it or accessing other credentials.
+Managing an existing provider no longer re-tests configured models by default: the edit "模型"
+entry first offers "保留已配置模型", which keeps every configured model checked and verified
+without generation requests. "重新选择并测试模型" reopens the full acquisition flow, where
+configured models are marked "已配置（默认保留）", skip candidate testing, and only new
+candidates require generation checks.
 Manage existing providers to view details, edit a draft, verify a selected model, or confirm deletion.
 Role-bound providers must be rebound through `/role` before deletion (both in interactive UI and non-UI
 slash command `/provider rm <name>`, preventing dangling role references in `config.yml`; `omp-sync provider rm`

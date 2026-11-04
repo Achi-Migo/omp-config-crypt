@@ -116,12 +116,18 @@ async function showFailures(ctx, cache) {
 }
 
 /** Acquire a verified subset without mutating config, the registry, or either store. */
-export async function acquireProviderModels(ctx, { name, config, agentDir, seedIds = [] }) {
+export async function acquireProviderModels(ctx, { name, config, agentDir, seedIds = [], preservedIds = [] }) {
   if (typeof ctx.ui.askDialog !== "function") {
     ctx.ui.notify("当前宿主不支持空格多选，请升级 OMP", "error");
     return;
   }
   const working = { ...config }, existing = new Map((config.models || []).map(model => [model.id, model]));
+  const cache = new Map(), sources = new Map();
+  // Already-configured models keep verified status without any generation test (edit flow).
+  for (const id of unique(preservedIds)) {
+    if (!cache.has(id)) cache.set(id, { ok: true, latencyMs: null, preserved: true });
+    if (!sources.has(id)) sources.set(id, "已配置");
+  }
   if (working.api === "anthropic-messages") working.baseUrl = working.baseUrl.trim().replace(/\/+$/, "").replace(/\/v1$/i, "");
   let configuredProviders;
   try { configuredProviders = listProviders({ agentDir }); }
@@ -132,7 +138,7 @@ export async function acquireProviderModels(ctx, { name, config, agentDir, seedI
     catalog = ctx.modelRegistry.getAll("chat");
     if (!Array.isArray(catalog)) throw new Error("Invalid registry");
   } catch { catalog = []; ctx.ui.notify("本机模型目录不可用", "warning"); }
-  const cache = new Map(), sources = new Map(), stageIds = [[], [], [], []];
+  const stageIds = [[], [], [], []];
   let stage = 0, mode = "stage", retry = false;
   const available = () => [...sources.keys()].filter(id => cache.get(id)?.ok);
   const check = async (ids, source) => {
@@ -186,8 +192,11 @@ export async function acquireProviderModels(ctx, { name, config, agentDir, seedI
       const labels = new Map(available().map(id => [id, id]));
       const result = await ctx.ui.askDialog([{
         id: "provider-models", header: "MODELS", question: "选择已验证模型 · 空格勾选 · Enter 确认 · Esc 返回", multi: true,
-        options: [...labels.keys()].map(id => ({ label: id,
-          description: `可用 · ${cache.get(id).latencyMs} ms · 来源: ${sources.get(id)}` })),
+        options: [...labels.keys()].map(id => {
+          const entry = cache.get(id);
+          return { label: id,
+            description: entry.preserved ? "已配置（默认保留）" : `可用 · ${entry.latencyMs} ms · 来源: ${sources.get(id)}` };
+        }),
       }]);
       if (!result || result.kind !== "submit") { mode = "menu"; continue; }
       const answer = result.results?.find(item => item.id === "provider-models");

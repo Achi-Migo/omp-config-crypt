@@ -1,6 +1,6 @@
 {
   "name": "omp-config-crypt",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "Universal cross-platform encrypted portability for omp config, extensions, and instructions",
   "type": "module",
   "license": "MIT",
