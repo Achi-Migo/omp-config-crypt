@@ -762,7 +762,13 @@ export function adaptLegacySnapshot(snapshot) {
  * Plans the 3-way synchronization between local environment, local baseline, and remote snapshot.
  * Returns { namespace, actions, conflicts, blocked, prerequisites, writes }
  */
-export function planSync(snapshot, root = configRoot()) {
+export const SYNC_STRATEGIES = new Set(["manual", "prefer-remote", "prefer-local"]);
+
+export function planSync(snapshot, root = configRoot(), options = {}) {
+  const strategy = options.strategy == null || options.strategy === undefined ? "manual" : options.strategy;
+  if (!SYNC_STRATEGIES.has(strategy)) {
+    throw new Error(`Invalid sync strategy '${strategy}'; expected one of: ${Array.from(SYNC_STRATEGIES).join(", ")}`);
+  }
   const validSnapshot = validateSnapshot(snapshot);
   const policy = readSyncPolicy(root);
   const state = readSyncState(root);
@@ -983,6 +989,28 @@ export function planSync(snapshot, root = configRoot()) {
       acceptedTransitions.set(id, { hash: baselineHash, tombstone: false });
     } else if (reason === "remote-deleted" || reason === "already-absent") {
       acceptedTransitions.set(id, { hash: SENTINEL_DELETED, tombstone: true });
+    }
+
+    // Strategy-based resolution of otherwise-unresolvable conflicts.
+    if (plannedAction === "conflict" && strategy !== "manual") {
+      if (strategy === "prefer-remote") {
+        if (isRemoteResource) {
+          plannedAction = "update";
+          reason = "conflict-resolved-remote-preferred";
+          effectiveValue = remoteVal;
+          acceptedTransitions.set(id, { hash: remoteHash, tombstone: false });
+        } else {
+          plannedAction = "delete";
+          reason = "conflict-resolved-remote-preferred";
+          acceptedTransitions.set(id, { hash: SENTINEL_DELETED, tombstone: true });
+        }
+      } else {
+        plannedAction = localPresent ? "keep" : "delete";
+        reason = "conflict-resolved-local-preferred";
+        acceptedTransitions.set(id, localPresent
+          ? { hash: localHash, tombstone: false }
+          : { hash: SENTINEL_DELETED, tombstone: true });
+      }
     }
 
     // Check for plugin prerequisite if plannedAction is add or update

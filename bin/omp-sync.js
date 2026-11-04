@@ -58,6 +58,9 @@ Commands:
   pull <gist:id|url>       Download and restore configs from Gist or HTTP URL
                            (-f/--force adopts a differing remote namespace; local
                            policy/state are backed up to .bak first)
+                           (--strategy prefer-remote|prefer-local auto-resolves
+                           conflicts by taking remote or local side; default:
+                           report conflicts and abort)
   rollback                 Revert the most recent config restore from its backup
   rehydrate                Rehydrate and repair locked/linked plugins in ~/.omp/plugins
   maint / gc [--force]     Run automatic storage maintenance, WAL checkpoint & GC
@@ -84,6 +87,7 @@ Options:
       --public             Save as public (synced across machines via models.yml)
   -y, --yes                Non-interactive mode (use defaults without prompting)
   -f, --force              Force operations (pull: adopt differing remote namespace)
+      --strategy <mode>    Conflict resolution for pull: prefer-remote | prefer-local
       --profile <name>       Target specific profile scene (e.g. dev, ops)
 
 Environment Variables:
@@ -114,6 +118,7 @@ function parseCliArgs(argv) {
     isPrivate: null,
     nonInteractive: false,
     force: false,
+    strategy: null,
     checkOnly: false,
     positional: [],
     profile: null,
@@ -152,6 +157,10 @@ function parseCliArgs(argv) {
       options.nonInteractive = true;
     } else if (a === "-f" || a === "--force") {
       options.force = true;
+    } else if (a === "--strategy") {
+      options.strategy = args[++i];
+    } else if (a.startsWith("--strategy=")) {
+      options.strategy = a.slice(11);
     } else if (a === "--check") {
       options.checkOnly = true;
     } else if (a === "--profile") {
@@ -310,6 +319,7 @@ async function main() {
         const pass = await resolvePass(options.pass);
         const res = importEncrypted(options.target, pass, root, {
           dryRun: options.dryRun,
+          strategy: options.strategy,
         });
         if (res.adaptedFile) {
           console.log(`[import] incompatible v${res.legacy?.from}; adapted -> ${res.adaptedFile}`);
@@ -361,8 +371,8 @@ async function main() {
         const token = await resolveToken(options.token, target.kind === "gist");
         const res =
           target.kind === "gist"
-            ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun, force: options.force })
-            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun, force: options.force });
+            ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy })
+            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy });
         if (res.adoptedNamespace) {
           console.log(`[pull] Adopted remote namespace ${res.adoptedNamespace} (--force); prior policy/state saved as .bak`);
         }

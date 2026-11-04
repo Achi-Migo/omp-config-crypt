@@ -56,6 +56,12 @@ npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN" --
 # automatically (no --force needed); corrupt policy/state JSON is backed up and rebuilt
 npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN"
 
+# Conflict resolution: when local files differ from remote with no baseline
+# (initial-conflict-both-exist-different), default behavior aborts. Auto-resolve:
+#   --strategy prefer-remote  overwrite local with remote (typical fresh-machine pull)
+#   --strategy prefer-local   keep local files and adopt them as the new baseline
+npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN" --strategy prefer-remote
+
 # Rollback to previous configuration snapshot
 npx omp-config-crypt rollback
 

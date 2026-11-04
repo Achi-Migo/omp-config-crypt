@@ -364,7 +364,7 @@ export function restoreArchive(blob, pass, root = configRoot(), options = {}) {
   }
 
   const dryRun = Boolean(options.dryRun);
-  const plan = planSync(effectivePayload, root);
+  const plan = planSync(effectivePayload, root, { strategy: options.strategy });
 
   if (dryRun) {
     return {

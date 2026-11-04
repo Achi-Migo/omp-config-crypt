@@ -3175,3 +3175,73 @@ test("57. planUpgrade compares local vs latest semver", () => {
   assert.equal(newer.reason, "local is newer");
   assert.equal(planUpgrade("0.7.0", "").action, "unknown");
 });
+
+test("N. Strategy resolution for initial both-exist-different conflicts", async (t) => {
+  const env = makeTempEnv();
+  t.after(env.cleanup);
+
+  const rootA = env.a.agent;
+  const rootB = env.b.agent;
+
+  fs.writeFileSync(
+    path.join(rootA, "mcp.json"),
+    JSON.stringify({ mcpServers: { srv: { command: "node", args: ["a.js"] } } }),
+    "utf8"
+  );
+  await setResourceScope(rootA, "mcp:srv", "public");
+  const { blob } = buildArchive(TEST_PASS, rootA);
+  const payload = decryptTestArchive(blob);
+
+  // B has a different local copy and no baseline -> hard conflict
+  fs.writeFileSync(
+    path.join(rootB, "mcp.json"),
+    JSON.stringify({ mcpServers: { srv: { command: "node", args: ["b.js"] } } }),
+    "utf8"
+  );
+
+  const planManual = planSync(payload, rootB);
+  assert.equal(planManual.conflicts.length, 1);
+
+  // Invalid strategy must be rejected
+  assert.throws(() => planSync(payload, rootB, { strategy: "bogus" }), /Invalid sync strategy/);
+
+  // prefer-remote: remote overwrites local, baseline adopted
+  const planR = planSync(payload, rootB, { strategy: "prefer-remote" });
+  assert.equal(planR.conflicts.length, 0);
+  const actR = planR.actions.find((a) => a.id === "mcp:srv");
+  assert.equal(actR.action, "update");
+  assert.equal(actR.reason, "conflict-resolved-remote-preferred");
+  const resR = applySyncPlan(planR, rootB);
+  assert.equal(resR.filesWritten >= 1, true);
+  const mcpB = JSON.parse(fs.readFileSync(path.join(rootB, "mcp.json"), "utf8"));
+  assert.equal(mcpB.mcpServers.srv.args[0], "a.js");
+
+  // Now diverge locally and pull again with prefer-local: local wins, no overwrite
+  fs.writeFileSync(
+    path.join(rootB, "mcp.json"),
+    JSON.stringify({ mcpServers: { srv: { command: "node", args: ["b2.js"] } } }),
+    "utf8"
+  );
+  const planL = planSync(payload, rootB, { strategy: "prefer-local" });
+  assert.equal(planL.conflicts.length, 0);
+  const actL = planL.actions.find((a) => a.id === "mcp:srv");
+  assert.equal(actL.reason, "local-modified-remote-unchanged");
+
+  // Fresh no-baseline divergence with prefer-local keeps local copy
+  const env2 = makeTempEnv();
+  t.after(env2.cleanup);
+  const rootC = env2.b.agent;
+  fs.writeFileSync(
+    path.join(rootC, "mcp.json"),
+    JSON.stringify({ mcpServers: { srv: { command: "node", args: ["c.js"] } } }),
+    "utf8"
+  );
+  const planL2 = planSync(payload, rootC, { strategy: "prefer-local" });
+  assert.equal(planL2.conflicts.length, 0);
+  const actL2 = planL2.actions.find((a) => a.id === "mcp:srv");
+  assert.equal(actL2.action, "keep");
+  assert.equal(actL2.reason, "conflict-resolved-local-preferred");
+  applySyncPlan(planL2, rootC);
+  const mcpC = JSON.parse(fs.readFileSync(path.join(rootC, "mcp.json"), "utf8"));
+  assert.equal(mcpC.mcpServers.srv.args[0], "c.js");
+});
