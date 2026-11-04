@@ -38,6 +38,7 @@ import {
   pruneOldBackups,
   formatSyncReport,
   extractDryRun,
+  parseSpec,
   adaptArchive,
   selectPublicResources,
   inspectArchivePayload,
@@ -2080,17 +2081,39 @@ test("32. Crash mid-commit leaves a recoverable lock and never accepts a residua
 });
 
 test("33. extractDryRun recognizes independent dry-run tokens and preserves path spaces", (t) => {
-  assert.deepEqual(extractDryRun("archive.enc --dry-run"), { dryRun: true, clean: "archive.enc" });
-  assert.deepEqual(extractDryRun("--dry-run archive.enc"), { dryRun: true, clean: "archive.enc" });
-  assert.deepEqual(extractDryRun("archive.enc -d"), { dryRun: true, clean: "archive.enc" });
-  assert.deepEqual(extractDryRun("-d archive.enc"), { dryRun: true, clean: "archive.enc" });
-  assert.deepEqual(extractDryRun("\"my archive.enc\" --dry-run"), { dryRun: true, clean: "my archive.enc" });
-  assert.deepEqual(extractDryRun("'spaced file.enc' -d"), { dryRun: true, clean: "spaced file.enc" });
+  assert.deepEqual(extractDryRun("archive.enc --dry-run"), { dryRun: true, force: false, strategy: null, clean: "archive.enc" });
+  assert.deepEqual(extractDryRun("--dry-run archive.enc"), { dryRun: true, force: false, strategy: null, clean: "archive.enc" });
+  assert.deepEqual(extractDryRun("archive.enc -d"), { dryRun: true, force: false, strategy: null, clean: "archive.enc" });
+  assert.deepEqual(extractDryRun("-d archive.enc"), { dryRun: true, force: false, strategy: null, clean: "archive.enc" });
+  assert.deepEqual(extractDryRun("\"my archive.enc\" --dry-run"), { dryRun: true, force: false, strategy: null, clean: "my archive.enc" });
+  assert.deepEqual(extractDryRun("'spaced file.enc' -d"), { dryRun: true, force: false, strategy: null, clean: "spaced file.enc" });
   assert.deepEqual(
     extractDryRun("https://example.invalid/path?x=--dry-run"),
-    { dryRun: false, clean: "https://example.invalid/path?x=--dry-run" }
+    { dryRun: false, force: false, strategy: null, clean: "https://example.invalid/path?x=--dry-run" }
   );
-  assert.deepEqual(extractDryRun("plain.enc"), { dryRun: false, clean: "plain.enc" });
+  assert.deepEqual(extractDryRun("plain.enc"), { dryRun: false, force: false, strategy: null, clean: "plain.enc" });
+
+  // Strategy flags are parsed out, never leaked into the positional spec
+  assert.deepEqual(
+    extractDryRun("gist:8b9dbf62 --strategy prefer-remote -f"),
+    { dryRun: false, force: true, strategy: "prefer-remote", clean: "gist:8b9dbf62" }
+  );
+  assert.deepEqual(
+    extractDryRun("--strategy=prefer-local gist:abc -d"),
+    { dryRun: true, force: false, strategy: "prefer-local", clean: "gist:abc" }
+  );
+  assert.throws(() => extractDryRun("--strategy"), /--strategy requires a value/);
+  assert.throws(() => extractDryRun("--strategy --force gist:abc"), /--strategy requires a value/);
+  assert.throws(() => extractDryRun("gist:abc --bogus"), /unknown flag: --bogus/);
+
+  // parseSpec never treats trailing flags as part of the gist id
+  assert.deepEqual(parseSpec("gist:8b9dbf629d462142c2962d874a49e9fb --strategy prefer-remote"), {
+    kind: "gist",
+    id: "8b9dbf629d462142c2962d874a49e9fb",
+  });
+  assert.deepEqual(parseSpec("gist:new"), { kind: "gist", id: "new" });
+  assert.deepEqual(parseSpec("https://example.com/a.enc"), { kind: "http", url: "https://example.com/a.enc" });
+  assert.throws(() => parseSpec("https://example.com/a.enc --strategy prefer-remote"), /expected gist/);
 });
 
 test("34. Sync CLI rejects obsolete rehydrate flags and keeps independent rehydrate help", (t) => {
@@ -3034,8 +3057,8 @@ test("52. resolveNpmCommand maps win32 to npm.cmd with shell", () => {
 });
 
 test("53. pull --force adopts remote namespace with .bak backups; extractDryRun strips --force", async (t) => {
-  assert.deepEqual(extractDryRun("gist:abc --force"), { dryRun: false, force: true, clean: "gist:abc" });
-  assert.deepEqual(extractDryRun("gist:abc"), { dryRun: false, clean: "gist:abc" });
+  assert.deepEqual(extractDryRun("gist:abc --force"), { dryRun: false, force: true, strategy: null, clean: "gist:abc" });
+  assert.deepEqual(extractDryRun("gist:abc"), { dryRun: false, force: false, strategy: null, clean: "gist:abc" });
 
   const env = makeTempEnv("omp-ns-force-");
   t.after(env.cleanup);

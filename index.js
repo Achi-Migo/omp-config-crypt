@@ -750,23 +750,28 @@ export async function pullHttp(url, pass, root = configRoot(), token = envToken(
 }
 
 export function parseSpec(spec) {
-  const s = spec.trim();
-  if (s.startsWith("gist:")) return { kind: "gist", id: s.slice(5) || "new" };
-  if (/^https?:\/\//.test(s)) return { kind: "http", url: s };
+  const s = String(spec || "").trim();
+  if (s.startsWith("gist:")) return { kind: "gist", id: s.slice(5).split(/\s+/)[0] || "new" };
+  if (/^https?:\/\/\S+$/.test(s)) return { kind: "http", url: s };
   throw new Error("expected gist:<id|new> or an https URL");
 }
 
 export function extractDryRun(str) {
   const raw = String(str || "").trim();
-  if (!raw) return { dryRun: false, clean: "" };
-  const tokens = [];
-  const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|(\S+)/g;
+  if (!raw) return { dryRun: false, force: false, strategy: null, clean: "" };
+  const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^"\\]*)*)'|(\S+)/g;
   let match;
   let dryRun = false;
   let force = false;
+  let strategy = null;
   const kept = [];
+  const tokens = [];
   while ((match = re.exec(raw))) {
     const token = match[1] !== undefined ? match[1] : match[2] !== undefined ? match[2] : match[3];
+    tokens.push(token);
+  }
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
     if (token === "--dry-run" || token === "-d") {
       dryRun = true;
       continue;
@@ -775,11 +780,24 @@ export function extractDryRun(str) {
       force = true;
       continue;
     }
+    if (token === "--strategy") {
+      const value = tokens[++i];
+      if (value === undefined || value.startsWith("-")) {
+        throw new Error("--strategy requires a value: prefer-remote | prefer-local");
+      }
+      strategy = value;
+      continue;
+    }
+    if (token.startsWith("--strategy=")) {
+      strategy = token.slice(11);
+      continue;
+    }
+    if (token.startsWith("-") && token !== "-") {
+      throw new Error(`unknown flag: ${token}`);
+    }
     kept.push(token);
   }
-  const result = { dryRun, clean: kept.join(" ") };
-  if (force) result.force = true;
-  return result;
+  return { dryRun, force, strategy, clean: kept.join(" ") };
 }
 
 export function formatSyncReport(result = {}) {
@@ -1017,14 +1035,14 @@ export default function (pi) {
   pi.registerCommand("config-import", {
     description: "Decrypt and restore an omp config archive (--dry-run to preview)",
     handler: async (args, ctx) => {
-      const { dryRun, clean: src } = extractDryRun(args || "");
+      const { dryRun, strategy, clean: src } = extractDryRun(args || "");
       if (!src) {
-        ctx.ui.notify("usage: /config-import <file.enc> [--dry-run]", "error");
+        ctx.ui.notify("usage: /config-import <file.enc> [--dry-run] [--strategy prefer-remote|prefer-local]", "error");
         return;
       }
       try {
         const pass = await askPass(ctx, "Import passphrase");
-        const r = importEncrypted(src, pass, configRoot(), { dryRun });
+        const r = importEncrypted(src, pass, configRoot(), { dryRun, strategy });
         if (r.adaptedFile) {
           ctx.ui.notify(`[import] incompatible v${r.legacy?.from}; adapted -> ${r.adaptedFile}`, "info");
         }
@@ -1076,9 +1094,9 @@ export default function (pi) {
         const sel = await selectPublicResources(ctx, root);
         if (sel === null) return;
       }
-      const { dryRun, force, clean: spec } = extractDryRun(args || "");
+      const { dryRun, force, strategy, clean: spec } = extractDryRun(args || "");
       if (!spec) {
-        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run] [--force]", "error");
+        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run] [--force] [--strategy prefer-remote|prefer-local]", "error");
         return;
       }
       try {
@@ -1086,8 +1104,8 @@ export default function (pi) {
         const pass = await askPass(ctx, "Pull passphrase");
         const token = await askToken(ctx, "Cloud token", target.kind === "gist");
         const r = target.kind === "gist"
-          ? await pullGist(target.id, pass, configRoot(), token, { dryRun, force })
-          : await pullHttp(target.url, pass, configRoot(), token, { dryRun, force });
+          ? await pullGist(target.id, pass, configRoot(), token, { dryRun, force, strategy })
+          : await pullHttp(target.url, pass, configRoot(), token, { dryRun, force, strategy });
         if (r.adoptedNamespace) {
           ctx.ui.notify(`[pull] adopted remote namespace ${r.adoptedNamespace}; prior policy/state saved as .bak`, "info");
         }
