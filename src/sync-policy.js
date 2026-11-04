@@ -214,7 +214,7 @@ export function readSyncPolicy(root) {
 /**
  * Writes sync-policy.local.json atomically using temp file + rename.
  */
-function writeSyncPolicyAtomic(root, policy) {
+export function writeSyncPolicyAtomic(root, policy) {
   if (!fs.existsSync(root)) {
     fs.mkdirSync(root, { recursive: true });
   }

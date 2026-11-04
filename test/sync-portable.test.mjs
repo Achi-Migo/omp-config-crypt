@@ -14,6 +14,7 @@ import {
   ompHome,
   buildArchive,
   restoreArchive,
+  restoreRemoteArchive,
   exportEncrypted,
   importEncrypted,
   pushHttp,
@@ -42,6 +43,7 @@ import {
   inspectArchivePayload,
   adaptLegacySnapshot,
 } from "../index.js";
+import { planUpgrade } from "../src/maintenance.js";
 import pluginEntry from "../index.js";
 import { parseYamlStrict } from "../src/sync-resources.js";
 import { getSyncPlanTransaction } from "../src/sync-plan.js";
@@ -3029,4 +3031,147 @@ test("52. resolveNpmCommand maps win32 to npm.cmd with shell", () => {
     Object.defineProperty(process, "platform", { value: original, configurable: true });
   }
   assert.deepEqual(resolveNpmCommand(), { file: "npm", shell: false });
+});
+
+test("53. pull --force adopts remote namespace with .bak backups; extractDryRun strips --force", async (t) => {
+  assert.deepEqual(extractDryRun("gist:abc --force"), { dryRun: false, force: true, clean: "gist:abc" });
+  assert.deepEqual(extractDryRun("gist:abc"), { dryRun: false, clean: "gist:abc" });
+
+  const env = makeTempEnv("omp-ns-force-");
+  t.after(env.cleanup);
+
+  fs.writeFileSync(
+    path.join(env.a.agent, "models.yml"),
+    "providers:\n  demo:\n    baseUrl: https://v1.example\n    apiKey: v1\n"
+  );
+  await setResourceScope(env.a.agent, "provider:demo", "public");
+  const { blob } = buildArchive(TEST_PASS, env.a.agent);
+
+  fs.writeFileSync(
+    path.join(env.b.agent, "models.yml"),
+    "providers:\n  local:\n    baseUrl: https://v9.example\n    apiKey: local\n"
+  );
+  await setResourceScope(env.b.agent, "provider:local", "public");
+  // Simulate a machine that has synced before: state file exists, so the public
+  // resource in its policy means silent namespace takeover must stay blocked.
+  writeSyncState(env.b.agent, {
+    version: 1,
+    namespace: readSyncPolicy(env.b.agent).namespace,
+    resources: { "provider:local": { hash: canonicalHash({ baseUrl: "https://v9.example", apiKey: "local" }), hashFormat: "portable-v1" } },
+    tombstones: [],
+  });
+
+  // Without force the takeover stays blocked
+  await assert.throws(() => restoreRemoteArchive(blob, TEST_PASS, env.b.agent), /Namespace mismatch/);
+
+  const stateExistedBefore = fs.existsSync(path.join(env.b.agent, "sync-state.local.json"));
+  const res = restoreRemoteArchive(blob, TEST_PASS, env.b.agent, { force: true });
+  assert.ok(res.adoptedNamespace && /^[0-9a-f-]{36}$/.test(res.adoptedNamespace));
+  assert.equal(fs.readFileSync(path.join(env.b.agent, "models.yml"), "utf8").includes("v1.example"), true);
+
+  const statePath = path.join(env.b.agent, "sync-state.local.json");
+  if (stateExistedBefore) {
+    assert.equal(fs.existsSync(`${statePath}.bak`), true);
+  }
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.namespace, res.adoptedNamespace);
+  const policy = JSON.parse(fs.readFileSync(path.join(env.b.agent, "sync-policy.local.json"), "utf8"));
+  assert.equal(policy.namespace, res.adoptedNamespace);
+  assert.equal(fs.existsSync(path.join(env.b.agent, "sync-policy.local.json.bak")), true);
+
+  // Idempotent: second force pull succeeds without further adoption
+  const res2 = restoreRemoteArchive(blob, TEST_PASS, env.b.agent, { force: true });
+  assert.equal(res2.adoptedNamespace, undefined);
+});
+
+test("54. pull auto-adopts remote namespace when local has no sync state", async (t) => {
+  const env = makeTempEnv("omp-ns-auto-");
+  t.after(env.cleanup);
+
+  fs.writeFileSync(
+    path.join(env.a.agent, "models.yml"),
+    "providers:\n  demo:\n    baseUrl: https://v1.example\n    apiKey: v1\n"
+  );
+  await setResourceScope(env.a.agent, "provider:demo", "public");
+  const remoteNamespace = readSyncPolicy(env.a.agent).namespace;
+  const { blob } = buildArchive(TEST_PASS, env.a.agent);
+
+  fs.writeFileSync(
+    path.join(env.b.agent, "models.yml"),
+    "providers:\n  local:\n    baseUrl: https://v9.example\n    apiKey: local\n"
+  );
+  await setResourceScope(env.b.agent, "provider:local", "public");
+  // Machine that never synced: no state file -> silent takeover is safe
+  fs.rmSync(path.join(env.b.agent, "sync-state.local.json"), { force: true });
+  assert.equal(fs.existsSync(path.join(env.b.agent, "sync-state.local.json")), false);
+
+  const res = restoreRemoteArchive(blob, TEST_PASS, env.b.agent);
+  assert.equal(res.adoptedNamespace, remoteNamespace);
+  assert.ok(Array.isArray(res.healed) && res.healed.includes("namespace:auto-adopted"));
+  assert.equal(readSyncPolicy(env.b.agent).namespace, remoteNamespace);
+  assert.equal(fs.existsSync(path.join(env.b.agent, "sync-policy.local.json.bak")), true);
+});
+
+test("55. pull without force still blocks when local holds a public configuration set", async (t) => {
+  const env = makeTempEnv("omp-ns-guard-");
+  t.after(env.cleanup);
+
+  fs.writeFileSync(
+    path.join(env.a.agent, "models.yml"),
+    "providers:\n  demo:\n    baseUrl: https://v1.example\n    apiKey: v1\n"
+  );
+  await setResourceScope(env.a.agent, "provider:demo", "public");
+  const { blob } = buildArchive(TEST_PASS, env.a.agent);
+
+  fs.writeFileSync(
+    path.join(env.b.agent, "models.yml"),
+    "providers:\n  local:\n    baseUrl: https://v9.example\n    apiKey: local\n"
+  );
+  await setResourceScope(env.b.agent, "provider:local", "public");
+  // Local machine has synced before (state + public resource): silent takeover must stay blocked
+  writeSyncState(env.b.agent, {
+    version: 1,
+    namespace: readSyncPolicy(env.b.agent).namespace,
+    resources: {
+      "provider:local": {
+        hash: canonicalHash({ baseUrl: "https://v9.example", apiKey: "local" }),
+        hashFormat: "portable-v1",
+      },
+    },
+    tombstones: [],
+  });
+
+  await assert.throws(() => restoreRemoteArchive(blob, TEST_PASS, env.b.agent), /Namespace mismatch/);
+});
+
+test("56. pull heals corrupt policy metadata before restore", async (t) => {
+  const env = makeTempEnv("omp-ns-heal-");
+  t.after(env.cleanup);
+
+  fs.writeFileSync(
+    path.join(env.a.agent, "models.yml"),
+    "providers:\n  demo:\n    baseUrl: https://v1.example\n    apiKey: v1\n"
+  );
+  await setResourceScope(env.a.agent, "provider:demo", "public");
+  const { blob } = buildArchive(TEST_PASS, env.a.agent);
+
+  fs.writeFileSync(path.join(env.b.agent, "sync-policy.local.json"), "{corrupt");
+
+  const res = restoreRemoteArchive(blob, TEST_PASS, env.b.agent);
+  assert.ok(Array.isArray(res.healed) && res.healed.includes("policy:rebuilt-from-corrupt"));
+  const corruptBackups = fs
+    .readdirSync(env.b.agent)
+    .filter((f) => f.startsWith("sync-policy.local.json.corrupt-"));
+  assert.equal(corruptBackups.length > 0, true);
+  const policy = readSyncPolicy(env.b.agent);
+  assert.equal(policy.version, 1);
+});
+
+test("57. planUpgrade compares local vs latest semver", () => {
+  assert.equal(planUpgrade("0.6.6", "0.7.0").action, "upgrade");
+  assert.equal(planUpgrade("0.7.0", "0.7.0").action, "none");
+  const newer = planUpgrade("0.7.1", "0.7.0");
+  assert.equal(newer.action, "none");
+  assert.equal(newer.reason, "local is newer");
+  assert.equal(planUpgrade("0.7.0", "").action, "unknown");
 });

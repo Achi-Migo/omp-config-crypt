@@ -43,6 +43,7 @@ import { getRoles, setRole, VALID_ROLES } from "./src/role-manager.js";
 import { handleProviderCommand, providerCompletions } from "./src/provider-menu.js";
 import {
   runMaintenance,
+  runUpgrade,
   cleanCorruptFiles,
   pruneOldBackups,
   cleanObsoleteFiles,
@@ -70,6 +71,7 @@ export {
   setRole,
   VALID_ROLES,
   runMaintenance,
+  runUpgrade,
   cleanCorruptFiles,
   pruneOldBackups,
   cleanObsoleteFiles,
@@ -109,6 +111,8 @@ import {
   inspectArchivePayload,
   adaptLegacySnapshot,
   planSync,
+  adoptSyncNamespace,
+  healSyncMetadata,
 } from "./src/sync-plan.js";
 import {
   applySyncPlan,
@@ -623,12 +627,49 @@ export async function pushGist(id, pass, root = configRoot(), token = envToken()
   return { id: data.id, url: data.html_url, files, bytes: blob.length };
 }
 
-function restoreRemoteArchive(blob, pass, root = configRoot(), options = {}) {
+/**
+ * A local install may take over a remote namespace without --force only when it holds
+ * no sync state worth losing: no state file, or a policy with no public resources.
+ */
+function canAutoAdoptLocal(root) {
+  if (!fs.existsSync(path.join(root, STATE_FILE))) return true;
+  try {
+    const policy = readSyncPolicy(root);
+    return !Object.values(policy.resources || {}).includes("public");
+  } catch {
+    return false;
+  }
+}
+
+function restoreWithForce(attempt, payload, root, options, healing = { healed: [] }) {
+  let res;
+  try {
+    res = attempt();
+  } catch (error) {
+    const blocked = error?.blocked;
+    const nsOnly =
+      Array.isArray(blocked) && blocked.length > 0 && blocked.every((b) => b.id === "namespace");
+    const auto = options.force || canAutoAdoptLocal(root);
+    if (!auto || !nsOnly || !payload?.namespace) throw error;
+    const adoption = adoptSyncNamespace(payload.namespace, root);
+    res = attempt();
+    return {
+      ...res,
+      adoptedNamespace: payload.namespace,
+      adoptedBackups: adoption.backups,
+      healed: [...healing.healed, options.force ? "namespace:forced-adopted" : "namespace:auto-adopted"],
+    };
+  }
+  return { ...res, healed: [...healing.healed] };
+}
+
+export function restoreRemoteArchive(blob, pass, root = configRoot(), options = {}) {
+  const healing = options.dryRun ? { healed: [] } : healSyncMetadata(root);
   const payload = decryptArchiveBlob(blob, pass);
   const inspection = inspectArchivePayload(payload);
 
   if (inspection.compatible) {
-    return restoreArchive(blob, pass, root, options);
+    return restoreWithForce(() => restoreArchive(blob, pass, root, options), payload, root, options, healing);
   }
 
   if (!inspection.adaptable) {
@@ -652,7 +693,7 @@ function restoreRemoteArchive(blob, pass, root = configRoot(), options = {}) {
 
   const adaptedFile = path.join(os.tmpdir(), `omp-archive-v3-${Date.now()}.enc`);
   fs.writeFileSync(adaptedFile, adaptedBlob, { mode: 0o600 });
-  const res = restoreArchive(adaptedBlob, pass, root, options);
+  const res = restoreWithForce(() => restoreArchive(adaptedBlob, pass, root, options), adapted, root, options, healing);
   return {
     ...res,
     adaptedFile,
@@ -721,19 +762,24 @@ export function extractDryRun(str) {
   const tokens = [];
   const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|(\S+)/g;
   let match;
-  while ((match = re.exec(raw))) {
-    tokens.push(match[1] !== undefined ? match[1] : match[2] !== undefined ? match[2] : match[3]);
-  }
   let dryRun = false;
+  let force = false;
   const kept = [];
-  for (const token of tokens) {
+  while ((match = re.exec(raw))) {
+    const token = match[1] !== undefined ? match[1] : match[2] !== undefined ? match[2] : match[3];
     if (token === "--dry-run" || token === "-d") {
       dryRun = true;
       continue;
     }
+    if (token === "--force" || token === "-f") {
+      force = true;
+      continue;
+    }
     kept.push(token);
   }
-  return { dryRun, clean: kept.join(" ") };
+  const result = { dryRun, clean: kept.join(" ") };
+  if (force) result.force = true;
+  return result;
 }
 
 export function formatSyncReport(result = {}) {
@@ -1030,9 +1076,9 @@ export default function (pi) {
         const sel = await selectPublicResources(ctx, root);
         if (sel === null) return;
       }
-      const { dryRun, clean: spec } = extractDryRun(args || "");
+      const { dryRun, force, clean: spec } = extractDryRun(args || "");
       if (!spec) {
-        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run]", "error");
+        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run] [--force]", "error");
         return;
       }
       try {
@@ -1040,8 +1086,14 @@ export default function (pi) {
         const pass = await askPass(ctx, "Pull passphrase");
         const token = await askToken(ctx, "Cloud token", target.kind === "gist");
         const r = target.kind === "gist"
-          ? await pullGist(target.id, pass, configRoot(), token, { dryRun })
-          : await pullHttp(target.url, pass, configRoot(), token, { dryRun });
+          ? await pullGist(target.id, pass, configRoot(), token, { dryRun, force })
+          : await pullHttp(target.url, pass, configRoot(), token, { dryRun, force });
+        if (r.adoptedNamespace) {
+          ctx.ui.notify(`[pull] adopted remote namespace ${r.adoptedNamespace}; prior policy/state saved as .bak`, "info");
+        }
+        if (Array.isArray(r.healed) && r.healed.length > 0) {
+          ctx.ui.notify(`[pull] self-healed: ${r.healed.join("; ")}`, "info");
+        }
         if (r.adaptedFile) {
           ctx.ui.notify(`[pull] incompatible v${r.legacy?.from}; adapted -> ${r.adaptedFile}`, "info");
         }
@@ -1065,6 +1117,21 @@ export default function (pi) {
         ctx.ui.notify(`rolled back ${r.files} files from ${r.rolledBackFrom}`, "info");
       } catch (error) {
         ctx.ui.notify(`config-rollback failed: ${error?.message ?? error}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("config-upgrade", {
+    description: "Check for and install omp-config-crypt updates (--check for check-only)",
+    handler: async (args, ctx) => {
+      try {
+        const r = runUpgrade({ check: /--check/.test(args || "") });
+        ctx.ui.notify(
+          `upgrade: local ${r.local}, latest ${r.latest ?? "unavailable"} -> ${r.action}${r.reason ? ` (${r.reason})` : ""}`,
+          r.action === "manual" ? "warn" : "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(`config-upgrade failed: ${error?.message ?? error}`, "error");
       }
     },
   });

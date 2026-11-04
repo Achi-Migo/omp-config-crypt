@@ -30,6 +30,7 @@ import {
   setRole,
   VALID_ROLES,
   runMaintenance,
+  runUpgrade,
   getCronStatus,
   installCron,
   removeCron,
@@ -55,10 +56,13 @@ Commands:
   adapt <srcFile> [out]    Adapt legacy v1/v2 archive to current v3 specification
   push <gist:id|url>       Encrypt and push configs to GitHub Gist or HTTP URL
   pull <gist:id|url>       Download and restore configs from Gist or HTTP URL
+                           (-f/--force adopts a differing remote namespace; local
+                           policy/state are backed up to .bak first)
   rollback                 Revert the most recent config restore from its backup
   rehydrate                Rehydrate and repair locked/linked plugins in ~/.omp/plugins
   maint / gc [--force]     Run automatic storage maintenance, WAL checkpoint & GC
   cron [install|status|rm] Manage OS-level scheduled crontab maintenance job
+  upgrade [--check]        Update omp-config-crypt in place (plugins dir or global)
   provider add <name>      Auto-probe and add an LLM provider (public or private)
   provider ls / list       List configured providers, models and active role bindings
   provider rm <name>       Remove a provider from public or private store
@@ -79,7 +83,7 @@ Options:
       --private            Save as private (local-only, unsynced, non-overwritten) [default]
       --public             Save as public (synced across machines via models.yml)
   -y, --yes                Non-interactive mode (use defaults without prompting)
-  -f, --force              Force operations (e.g. bypass maintenance debounce)
+  -f, --force              Force operations (pull: adopt differing remote namespace)
       --profile <name>       Target specific profile scene (e.g. dev, ops)
 
 Environment Variables:
@@ -110,6 +114,7 @@ function parseCliArgs(argv) {
     isPrivate: null,
     nonInteractive: false,
     force: false,
+    checkOnly: false,
     positional: [],
     profile: null,
   };
@@ -147,6 +152,8 @@ function parseCliArgs(argv) {
       options.nonInteractive = true;
     } else if (a === "-f" || a === "--force") {
       options.force = true;
+    } else if (a === "--check") {
+      options.checkOnly = true;
     } else if (a === "--profile") {
       options.profile = args[++i];
     } else if (a.startsWith("--profile=")) {
@@ -354,8 +361,14 @@ async function main() {
         const token = await resolveToken(options.token, target.kind === "gist");
         const res =
           target.kind === "gist"
-            ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun })
-            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun });
+            ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun, force: options.force })
+            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun, force: options.force });
+        if (res.adoptedNamespace) {
+          console.log(`[pull] Adopted remote namespace ${res.adoptedNamespace} (--force); prior policy/state saved as .bak`);
+        }
+        if (Array.isArray(res.healed) && res.healed.length > 0) {
+          console.log(`[pull] Self-healed: ${res.healed.join("; ")}`);
+        }
         if (res.adaptedFile) {
           console.log(`[pull] incompatible v${res.legacy?.from}; adapted -> ${res.adaptedFile}`);
         }
@@ -440,6 +453,13 @@ async function main() {
             console.warn(`[maint] ⚠ Native GC warning: ${res.gc.error}`);
           }
         }
+        break;
+      }
+      case "upgrade": {
+        const r = runUpgrade({ check: options.checkOnly });
+        console.log(`[upgrade] local ${r.local} / latest ${r.latest ?? "unavailable"}`);
+        console.log(`[upgrade] ${r.action}${r.reason ? `: ${r.reason}` : ""}`);
+        if (r.action === "manual") process.exitCode = 2;
         break;
       }
       case "cron": {

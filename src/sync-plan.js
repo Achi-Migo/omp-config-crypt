@@ -14,12 +14,14 @@ import {
   validateAssetFiles,
 } from "./sync-files.js";
 import {
+  POLICY_FILE,
   checkSettingOverlap,
   isExactSemver,
   readSyncPolicy,
   resolveResourceScope,
   resolveSyncNamespace,
   validateResourceId,
+  writeSyncPolicyAtomic,
 } from "./sync-policy.js";
 import {
   canonicalResourceValue,
@@ -190,6 +192,81 @@ export function writeSyncState(root = configRoot(), state) {
     try { fs.unlinkSync(tmp); } catch {}
     throw err;
   }
+}
+
+function backupSyncFile(root, fileName) {
+  const target = path.join(root, fileName);
+  if (!fs.existsSync(target)) return null;
+  const backup = `${target}.bak`;
+  fs.copyFileSync(target, backup);
+  return backup;
+}
+
+/**
+ * Adopts a remote namespace for explicit force pulls: aligns sync-policy.local.json and
+ * sync-state.local.json to the remote configuration set. Both existing files are backed
+ * up to <file>.bak before the rewrite. Local resources/scope entries are preserved; only
+ * the namespace pointer moves, so a subsequent pull applies the remote set as its own.
+ */
+export function adoptSyncNamespace(remoteNamespace, root = configRoot()) {
+  const ns = String(remoteNamespace ?? "").trim();
+  if (!ns) {
+    throw new Error("Cannot adopt namespace: remote namespace is empty");
+  }
+
+  const backups = [];
+  const policy = readSyncPolicy(root);
+  if (policy.namespace !== ns) {
+    const backup = backupSyncFile(root, POLICY_FILE);
+    if (backup) backups.push(backup);
+    policy.namespace = ns;
+    writeSyncPolicyAtomic(root, policy);
+  }
+
+  const statePath = path.join(root, STATE_FILE);
+  if (fs.existsSync(statePath)) {
+    const state = readSyncState(root);
+    if (state.namespace !== ns) {
+      backups.push(backupSyncFile(root, STATE_FILE));
+      state.namespace = ns;
+      writeSyncState(root, state);
+    }
+  }
+
+  return { namespace: ns, changed: backups.length > 0, backups: backups.filter(Boolean) };
+}
+
+const MINIMAL_STATE = () => ({ version: 1, resources: {}, tombstones: [] });
+
+/**
+ * Repairs unreadable sync metadata: if sync-policy.local.json or sync-state.local.json
+ * exists but fails strict parsing, it is backed up to <file>.corrupt-<ts> (compatible
+ * with maintenance cleanCorruptFiles retention) and rebuilt in a valid empty state so
+ * pull/push can proceed instead of failing. Only genuinely unreadable files are touched.
+ */
+export function healSyncMetadata(root = configRoot()) {
+  const healed = [];
+  const policyPath = path.join(root, POLICY_FILE);
+  if (fs.existsSync(policyPath)) {
+    try {
+      readSyncPolicy(root);
+    } catch {
+      fs.copyFileSync(policyPath, `${policyPath}.corrupt-${Date.now()}`);
+      writeSyncPolicyAtomic(root, { version: 1, resources: {} });
+      healed.push("policy:rebuilt-from-corrupt");
+    }
+  }
+  const statePath = path.join(root, STATE_FILE);
+  if (fs.existsSync(statePath)) {
+    try {
+      readSyncState(root);
+    } catch {
+      fs.copyFileSync(statePath, `${statePath}.corrupt-${Date.now()}`);
+      writeSyncState(root, MINIMAL_STATE());
+      healed.push("state:rebuilt-from-corrupt");
+    }
+  }
+  return { healed, backups: healed.length > 0 };
 }
 
 /**

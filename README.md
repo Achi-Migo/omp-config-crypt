@@ -1,4 +1,4 @@
-# omp-config-crypt (v0.5.0)
+# omp-config-crypt (v0.7.0)
 
 Universal, zero-repair cross-platform configuration encryption and synchronization engine for `omp` (Oh My Pi).
 
@@ -48,8 +48,20 @@ npx omp-config-crypt push gist:new --pass "mysecret" --token "$GITHUB_TOKEN"
 # Cloud Pull (GitHub Gist)
 npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN"
 
+# Cloud Pull adopting a different remote configuration set (takeover):
+# aligns local sync-policy/sync-state namespace to the remote one; both files are backed up to .bak first
+npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN" --force
+
+# Cloud Pull self-healing: machines with no sync state yet adopt the remote set
+# automatically (no --force needed); corrupt policy/state JSON is backed up and rebuilt
+npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN"
+
 # Rollback to previous configuration snapshot
 npx omp-config-crypt rollback
+
+# Self-update the package (plugins dir or global install); --check only reports
+npx omp-config-crypt upgrade --check
+npx omp-config-crypt upgrade
 ```
 
 # Provider Auto-Probing & Management (Public / Private)
@@ -77,9 +89,10 @@ Configuration exports include the installed `omp-config-crypt` source (excluding
 /config-push gist:new
 /config-push gist:<id>
 /config-push https://…
-/config-pull gist:<id> [--dry-run]
-/config-pull https://… [--dry-run]
+/config-pull gist:<id> [--dry-run] [--force]
+/config-pull https://… [--dry-run] [--force]
 /config-rollback
+/config-upgrade [--check]
 ```
 
 ### Provider control menu

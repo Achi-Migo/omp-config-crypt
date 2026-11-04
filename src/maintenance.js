@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { exec, execSync, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
+import { resolveNpmCommand } from "./rehydrator.js";
 
 const execAsync = promisify(exec);
 
@@ -292,5 +294,63 @@ export function removeCron() {
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
+  }
+}
+
+function cmpSemver(a, b) {
+  const pa = String(a).replace(/-.*$/, "").split(".").map(Number);
+  const pb = String(b).replace(/-.*$/, "").split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0) ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Compares the local package version against the latest published version.
+ */
+export function planUpgrade(localVersion, latestVersion) {
+  if (!localVersion || !latestVersion) return { action: "unknown", reason: "version unavailable" };
+  const c = cmpSemver(localVersion, latestVersion);
+  if (c === 0) return { action: "none", reason: "up to date" };
+  return c < 0 ? { action: "upgrade" } : { action: "none", reason: "local is newer" };
+}
+
+/**
+ * Checks npm for a newer omp-config-crypt and, unless check-only, updates the
+ * package in place: plugins installs are updated via the enclosing plugins root,
+ * everything else falls back to a global install. Dev/symlinked checkouts report
+ * manual upgrade instead of touching the working tree.
+ */
+export function runUpgrade({ check = false } = {}) {
+  const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const npmCmd = resolveNpmCommand();
+  let latest = "";
+  try {
+    latest = execFileSync(npmCmd.file, ["view", "omp-config-crypt", "version", "--registry", "https://registry.npmjs.org"], { encoding: "utf8", shell: npmCmd.shell }).trim();
+  } catch { /* latest stays empty; planUpgrade reports unknown */ }
+  const plan = planUpgrade(pkg.version, latest);
+
+  if (plan.action !== "upgrade" || check) {
+    return { local: pkg.version, latest: latest || null, ...plan };
+  }
+
+  const selfDir = path.dirname(fileURLToPath(import.meta.url));
+  let isDev = false;
+  try { isDev = fs.realpathSync(selfDir) !== selfDir; } catch {}
+  if (isDev) return { local: pkg.version, latest, action: "manual", reason: "dev/symlinked install; upgrade via git pull" };
+
+  const parts = selfDir.split(path.sep);
+  const nmIdx = parts.lastIndexOf("node_modules");
+  try {
+    if (nmIdx !== -1 && parts[nmIdx + 1] === "omp-config-crypt") {
+      const installRoot = path.join(...parts.slice(0, nmIdx));
+      execFileSync(npmCmd.file, ["install", "--prefix", installRoot, "omp-config-crypt@latest"], { stdio: "pipe", shell: npmCmd.shell });
+      return { local: pkg.version, latest, action: "upgraded" };
+    }
+    execFileSync(npmCmd.file, ["install", "-g", "omp-config-crypt@latest"], { stdio: "pipe", shell: npmCmd.shell });
+    return { local: pkg.version, latest, action: "upgraded" };
+  } catch {
+    return { local: pkg.version, latest, action: "manual", reason: "automatic install failed; run: npx -y omp-config-crypt@latest <command>" };
   }
 }
