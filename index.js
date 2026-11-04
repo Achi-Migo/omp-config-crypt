@@ -8,11 +8,13 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import {
   rehydratePlugins,
   getPluginLinks,
   savePluginLinks,
   detectMissingPlugins,
+  resolveNpmCommand,
 } from "./src/rehydrator.js";
 
 export {
@@ -20,6 +22,18 @@ export {
   getPluginLinks,
   savePluginLinks,
   detectMissingPlugins,
+  resolveNpmCommand,
+};
+import {
+  runPreflight,
+  probeGistAccess,
+  probeHttpAccess,
+} from "./src/preflight.js";
+
+export {
+  runPreflight,
+  probeGistAccess,
+  probeHttpAccess,
 };
 import {
   probeProvider,
@@ -342,6 +356,43 @@ export function adaptArchive(blob, pass) {
 }
 
 /**
+ * Installs the missing or mismatched plugin dependencies a sync plan blocked on.
+ * Versions come from the plan action value when present (internal/hand-built plans);
+ * public plans sanitize action values away, so the snapshot payload is consulted as
+ * fallback. Skipped entries keep their blocked state and surface as apply errors.
+ */
+export function fixPluginPrerequisites(plan, root, { install, payload = null } = {}) {
+  const npmCmd = resolveNpmCommand();
+  const doInstall = install ?? ((name, version) => {
+    execFileSync(
+      npmCmd.file,
+      ["install", "--prefix", path.join(ompHome(root), "plugins"), `${name}@${version}`],
+      { stdio: "pipe", shell: npmCmd.shell },
+    );
+  });
+  const payloadVersions = new Map((payload?.resources || []).map((resource) => [resource.id, resource.value]));
+  const fixed = [];
+  const skipped = [];
+  for (const action of plan.actions || []) {
+    if (action.action !== "blocked" || !String(action.id || "").startsWith("plugin:")) continue;
+    if (action.reason !== "plugin-not-installed" && action.reason !== "plugin-version-mismatch") continue;
+    const name = action.id.slice("plugin:".length);
+    const version = action.value?.version ?? payloadVersions.get(action.id)?.version ?? null;
+    if (!version) {
+      skipped.push(name);
+      continue;
+    }
+    try {
+      doInstall(name, version);
+    } catch (err) {
+      throw new Error(`plugin dependency install failed for ${name}@${version}: ${err.message}`);
+    }
+    fixed.push(`${name}@${version}`);
+  }
+  return { fixed, skipped };
+}
+
+/**
  * Restores an encrypted archive buffer into the config tree with 3-way merge planning and journaled transaction.
  */
 export function restoreArchive(blob, pass, root = configRoot(), options = {}) {
@@ -364,7 +415,15 @@ export function restoreArchive(blob, pass, root = configRoot(), options = {}) {
   }
 
   const dryRun = Boolean(options.dryRun);
-  const plan = planSync(effectivePayload, root, { strategy: options.strategy });
+  let plan = planSync(effectivePayload, root, { strategy: options.strategy });
+
+  // Self-healing: install plugin dependencies the plan blocked on, then replan once
+  // (the install mutates the plugins tree, so the original plan is stale). Remaining
+  // blocked actions still fail the apply.
+  if (!dryRun && plan.prerequisites.length > 0 && options.autoFixPlugins !== false) {
+    const fx = fixPluginPrerequisites(plan, root, { install: options.installFn, payload: effectivePayload });
+    if (fx.fixed.length > 0) plan = planSync(effectivePayload, root, { strategy: options.strategy });
+  }
 
   if (dryRun) {
     return {
@@ -705,14 +764,37 @@ export function restoreRemoteArchive(blob, pass, root = configRoot(), options = 
   };
 }
 
+/**
+ * Runs the pull preflight before any download; throws a preflight-failed error
+ * carrying the full checks list when a fail-status check blocks the pull.
+ */
+async function gatePullPreflight(root, target, token, options = {}) {
+  if (options.preflight === false) return [];
+  const pf = await runPreflight({ root, target, token, dryRun: Boolean(options.dryRun) });
+  if (!pf.ok) {
+    const err = new Error(
+      `preflight failed:\n${pf.checks
+        .filter((check) => check.status === "fail")
+        .map((check) => `  [FAIL] ${check.id}: ${check.detail}`)
+        .join("\n")}`,
+    );
+    err.checks = pf.checks;
+    throw err;
+  }
+  return pf.checks;
+}
+
 /** Pull the archive from a secret gist. */
 export async function pullGist(id, pass, root = configRoot(), token = envToken(), options = {}) {
   if (!token) throw new Error("GitHub token required: set OMP_CFG_CLOUD_TOKEN or GITHUB_TOKEN");
+  const preflightChecks = await gatePullPreflight(root, { kind: "gist", id }, token, options);
   const data = await gh(token, `/gists/${id}`);
   const content = data?.files?.[GIST_FILE]?.content;
   if (!content) throw new Error(`gist ${id} has no ${GIST_FILE}`);
   const blob = Buffer.from(content, "base64");
-  return restoreRemoteArchive(blob, pass, root, options);
+  const result = restoreRemoteArchive(blob, pass, root, options);
+  result.preflight = preflightChecks;
+  return result;
 }
 
 /** Push to any endpoint accepting PUT (presigned S3, WebDAV, custom). */
@@ -740,13 +822,16 @@ export async function pushHttp(url, pass, root = configRoot(), token = envToken(
 
 /** Pull from any endpoint serving the archive. */
 export async function pullHttp(url, pass, root = configRoot(), token = envToken(), options = {}) {
+  const preflightChecks = await gatePullPreflight(root, { kind: "http", url }, token, options);
   const res = await fetchWithRetry(url, {
     signal: AbortSignal.timeout(30_000),
     headers: token ? { authorization: `Bearer ${token}` } : {},
   });
   if (!res.ok) throw new Error(`GET ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const blob = Buffer.from(await res.arrayBuffer());
-  return restoreRemoteArchive(blob, pass, root, options);
+  const result = restoreRemoteArchive(blob, pass, root, options);
+  result.preflight = preflightChecks;
+  return result;
 }
 
 export function parseSpec(spec) {
@@ -1106,6 +1191,12 @@ export default function (pi) {
         const r = target.kind === "gist"
           ? await pullGist(target.id, pass, configRoot(), token, { dryRun, force, strategy })
           : await pullHttp(target.url, pass, configRoot(), token, { dryRun, force, strategy });
+        if (Array.isArray(r.preflight) && r.preflight.length > 0) {
+          ctx.ui.notify(
+            "[pull] preflight:\n" + r.preflight.map((c) => `  [${c.status.toUpperCase()}] ${c.id}: ${c.detail}`).join("\n"),
+            "info",
+          );
+        }
         if (r.adoptedNamespace) {
           ctx.ui.notify(`[pull] adopted remote namespace ${r.adoptedNamespace}; prior policy/state saved as .bak`, "info");
         }
@@ -1122,7 +1213,10 @@ export default function (pi) {
         }
       } catch (error) {
         const report = error?.plan ? `\n${formatSyncReport(error.plan)}` : "";
-        ctx.ui.notify(`config-pull failed: ${error?.message ?? error}${report}`, "error");
+        const checkLines = Array.isArray(error?.checks)
+          ? `\n${error.checks.map((c) => `  [${c.status.toUpperCase()}] ${c.id}: ${c.detail}`).join("\n")}`
+          : "";
+        ctx.ui.notify(`config-pull failed: ${error?.message ?? error}${report}${checkLines}`, "error");
       }
     },
   });
@@ -1150,6 +1244,27 @@ export default function (pi) {
         );
       } catch (error) {
         ctx.ui.notify(`config-upgrade failed: ${error?.message ?? error}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("config-doctor", {
+    description: "Preflight environment/config checks with self-healing (optional gist:<id> or https target)",
+    handler: async (args, ctx) => {
+      try {
+        const spec = String(args || "").trim();
+        let target = null;
+        let token = envToken();
+        if (spec) {
+          target = parseSpec(spec);
+          const asked = await askToken(ctx, "Cloud token", target.kind === "gist");
+          if (asked) token = asked;
+        }
+        const pf = await runPreflight({ root: configRoot(), target, token });
+        const lines = pf.checks.map((c) => `  [${c.status.toUpperCase()}] ${c.id}: ${c.detail}`).join("\n");
+        ctx.ui.notify(`[doctor] ${pf.ok ? "all checks passed" : "checks failed"}\n${lines}`, pf.ok ? "info" : "error");
+      } catch (error) {
+        ctx.ui.notify(`config-doctor failed: ${error?.message ?? error}`, "error");
       }
     },
   });

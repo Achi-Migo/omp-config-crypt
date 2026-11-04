@@ -43,7 +43,9 @@ import {
   selectPublicResources,
   inspectArchivePayload,
   adaptLegacySnapshot,
+  fixPluginPrerequisites,
 } from "../index.js";
+import { runPreflight, probeGistAccess } from "../src/preflight.js";
 import { planUpgrade } from "../src/maintenance.js";
 import pluginEntry from "../index.js";
 import { parseYamlStrict } from "../src/sync-resources.js";
@@ -3267,4 +3269,176 @@ test("N. Strategy resolution for initial both-exist-different conflicts", async 
   applySyncPlan(planL2, rootC);
   const mcpC = JSON.parse(fs.readFileSync(path.join(rootC, "mcp.json"), "utf8"));
   assert.equal(mcpC.mcpServers.srv.args[0], "c.js");
+});
+
+test("58. probeGistAccess classifies 200/401/404/network failure without parsing the body", async () => {
+  const seen = [];
+  const ok = await probeGistAccess("abc", "tok", async (url, init = {}) => {
+    seen.push({ url, headers: init.headers || {} });
+    return { ok: true, status: 200 };
+  });
+  assert.deepEqual(seen, [{ url: "https://api.github.com/gists/abc", headers: { accept: "application/vnd.github+json", authorization: "Bearer tok" } }]);
+  assert.deepEqual([ok.ok, ok.status, ok.message], [true, 200, "gist accessible"]);
+
+  const unauth = await probeGistAccess("abc", "tok", async () => ({ ok: false, status: 403 }));
+  assert.deepEqual(
+    [unauth.ok, unauth.status, unauth.message],
+    [false, 403, "token unauthorized (403): ensure OMP_CFG_CLOUD_TOKEN has 'gist' scope and belongs to the gist owner"],
+  );
+
+  const missing = await probeGistAccess("abc", "tok", async () => ({ ok: false, status: 404 }));
+  assert.deepEqual(
+    [missing.ok, missing.status, missing.message],
+    [false, 404, "gist not found (404): wrong id, or this token cannot see the gist"],
+  );
+
+  const down = await probeGistAccess("abc", "tok", async () => {
+    throw new TypeError("fetch failed");
+  });
+  assert.deepEqual([down.ok, down.status, down.message], [false, null, "api.github.com unreachable: fetch failed"]);
+});
+
+test("59. runPreflight heals metadata, self-upgrades, and gates remote access", async (t) => {
+  const env = makeTempEnv("omp-preflight-");
+  t.after(env.cleanup);
+  const root = env.a.agent;
+
+  const noUpgrade = () => ({ local: "0.8.1", latest: "0.8.1", action: "none", reason: "up to date" });
+
+  // 1. Happy path: npm present, registry upgrade available -> self-version fixed via a second upgradeFn({}) call
+  const calls = [];
+  const upgradeFn = (opts = {}) => {
+    calls.push({ ...opts });
+    return opts.check
+      ? { local: "0.8.1", latest: "0.9.0", action: "upgrade" }
+      : { local: "0.8.1", latest: "0.9.0", action: "upgraded" };
+  };
+  const pf = await runPreflight({
+    root,
+    target: { kind: "gist", id: "abc" },
+    token: "tok",
+    upgradeFn,
+    fetchImpl: async () => ({ ok: true, status: 200 }),
+  });
+  assert.equal(pf.ok, true);
+  assert.deepEqual(calls, [{ check: true }, {}]);
+  const byId = Object.fromEntries(pf.checks.map((c) => [c.id, c]));
+  assert.equal(byId["npm-cli"].status, "pass");
+  assert.deepEqual(
+    [byId.registry.status, byId.registry.detail],
+    ["pass", "local 0.8.1 / latest 0.9.0"],
+  );
+  assert.deepEqual(
+    [byId["self-version"].status, byId["self-version"].detail],
+    ["fixed", "upgraded 0.8.1 -> 0.9.0; restart omp to activate"],
+  );
+  assert.deepEqual([byId["remote-access"].status, byId["remote-access"].detail], ["pass", "gist accessible"]);
+
+  // 2. Registry unreachable: warn on registry and self-version, ok stays true
+  const pf2 = await runPreflight({
+    root,
+    target: { kind: "gist", id: "abc" },
+    token: "tok",
+    upgradeFn: () => ({ local: "0.8.1", latest: null, action: "unknown", reason: "version unavailable" }),
+    fetchImpl: async () => ({ ok: true, status: 200 }),
+  });
+  const byId2 = Object.fromEntries(pf2.checks.map((c) => [c.id, c]));
+  assert.deepEqual([byId2.registry.status, byId2.registry.detail], ["warn", "registry unreachable"]);
+  assert.equal(pf2.ok, true);
+
+  // 3. Remote 404: remote-access fails and ok flips false
+  const pf3 = await runPreflight({
+    root,
+    target: { kind: "gist", id: "nope" },
+    token: "tok",
+    upgradeFn: noUpgrade,
+    fetchImpl: async () => ({ ok: false, status: 404 }),
+  });
+  assert.equal(pf3.ok, false);
+  assert.deepEqual(pf3.checks.filter((c) => c.status === "fail").map((c) => c.id), ["remote-access"]);
+  assert.equal(pf3.checks.find((c) => c.id === "remote-access").detail, "gist not found (404): wrong id, or this token cannot see the gist");
+
+  // 4. Dry-run detects corrupt metadata without touching disk; apply heals it
+  fs.writeFileSync(path.join(root, "sync-policy.local.json"), "{corrupt", "utf8");
+  const pfDry = await runPreflight({ root, dryRun: true, upgradeFn: noUpgrade });
+  const metaDry = pfDry.checks.find((c) => c.id === "metadata");
+  assert.deepEqual([metaDry.status, metaDry.detail], ["warn", "corrupt; would heal on apply"]);
+  assert.equal(fs.readFileSync(path.join(root, "sync-policy.local.json"), "utf8"), "{corrupt");
+
+  const pfFix = await runPreflight({ root, upgradeFn: noUpgrade });
+  const metaFix = pfFix.checks.find((c) => c.id === "metadata");
+  assert.equal(metaFix.status, "fixed");
+  assert.match(metaFix.detail, /policy:rebuilt-from-corrupt/);
+  assert.equal(readSyncPolicy(root).version, 1);
+});
+
+test("60. fixPluginPrerequisites installs blocked plugin versions and autoFixPlugins=false keeps the guard", async (t) => {
+  const env = makeTempEnv("omp-fix-plugins-");
+  t.after(env.cleanup);
+
+  // Unit: plan-level collection with a hand-built blocked action
+  const installed = [];
+  const plan = {
+    actions: [
+      { id: "plugin:demo", action: "blocked", reason: "plugin-not-installed", targetPath: "plugins/package.json" },
+      { id: "plugin:other", action: "blocked", reason: "plugin-version-mismatch", targetPath: "plugins/package.json" },
+      { id: "provider:demo", action: "add", reason: "new-resource", targetPath: "models.yml" },
+    ],
+    prerequisites: ["Plugin 'demo' is not installed. Run: omp plugin install demo@1.2.3"],
+  };
+  const fx = fixPluginPrerequisites(plan, env.b.agent, {
+    install: (name, version) => installed.push(`${name}@${version}`),
+    payload: {
+      resources: [
+        { id: "plugin:demo", value: { name: "demo", version: "1.2.3", enabled: true } },
+        { id: "plugin:other", value: null },
+      ],
+    },
+  });
+  assert.deepEqual(fx, { fixed: ["demo@1.2.3"], skipped: ["other"] });
+  assert.deepEqual(installed, ["demo@1.2.3"]);
+
+  // Guard: restoreArchive with autoFixPlugins=false never installs and still throws blocked
+  fs.writeFileSync(path.join(env.a.plugins, "package.json"), JSON.stringify({ dependencies: { demo: "1.2.3" } }));
+  installPlugin(env.a, "demo", "1.2.3");
+  await setResourceScope(env.a.agent, "plugin:demo", "public");
+  const { blob } = buildArchive(TEST_PASS, env.a.agent);
+  let installCalls = 0;
+  await assert.throws(
+    () => restoreArchive(blob, TEST_PASS, env.b.agent, {
+      autoFixPlugins: false,
+      installFn: () => { installCalls += 1; },
+    }),
+    /blocked/i,
+  );
+  assert.equal(installCalls, 0);
+  assert.equal(fs.existsSync(path.join(env.b.plugins, "node_modules", "demo", "package.json")), false);
+});
+
+test("61. restoreArchive auto-installs missing plugin dependencies and applies after replan", async (t) => {
+  const env = makeTempEnv("omp-plugin-heal-");
+  t.after(env.cleanup);
+
+  fs.writeFileSync(path.join(env.a.plugins, "package.json"), JSON.stringify({ dependencies: { demo: "1.2.3" } }));
+  installPlugin(env.a, "demo", "1.2.3");
+  await setResourceScope(env.a.agent, "plugin:demo", "public");
+  const { blob } = buildArchive(TEST_PASS, env.a.agent);
+
+  const installed = [];
+  const installFn = (name, version) => {
+    installed.push(`${name}@${version}`);
+    fs.mkdirSync(path.join(env.b.plugins, "node_modules", ...name.split("/")), { recursive: true });
+    fs.writeFileSync(path.join(env.b.plugins, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({ name, version }));
+  };
+
+  const res = restoreArchive(blob, TEST_PASS, env.b.agent, { installFn });
+  assert.deepEqual(installed, ["demo@1.2.3"]);
+  assert.equal(res.blocked.length, 0);
+  assert.equal(res.files >= 1, true);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(env.b.plugins, "node_modules", "demo", "package.json"), "utf8")),
+    { name: "demo", version: "1.2.3" },
+  );
+  const state = readSyncState(env.b.agent);
+  assert.ok(state.resources["plugin:demo"]);
 });

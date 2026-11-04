@@ -40,6 +40,7 @@ import {
   inventoryResources,
   readSyncState,
   formatSyncReport,
+  runPreflight,
 } from "../index.js";
 function printHelp() {
   console.log(`
@@ -62,6 +63,8 @@ Commands:
                            conflicts by taking remote or local side; default:
                            report conflicts and abort)
   rollback                 Revert the most recent config restore from its backup
+  doctor [target]          Preflight env/config checks with self-healing
+                           (optional gist:<id> or https://url target)
   rehydrate                Rehydrate and repair locked/linked plugins in ~/.omp/plugins
   maint / gc [--force]     Run automatic storage maintenance, WAL checkpoint & GC
   cron [install|status|rm] Manage OS-level scheduled crontab maintenance job
@@ -376,6 +379,11 @@ async function main() {
         if (res.adoptedNamespace) {
           console.log(`[pull] Adopted remote namespace ${res.adoptedNamespace} (--force); prior policy/state saved as .bak`);
         }
+        if (Array.isArray(res.preflight) && res.preflight.length > 0) {
+          const tally = { pass: 0, fixed: 0, warn: 0 };
+          for (const c of res.preflight) tally[c.status] = (tally[c.status] || 0) + 1;
+          console.log(`[pull] preflight: ${tally.pass} pass, ${tally.fixed} fixed, ${tally.warn} warn`);
+        }
         if (Array.isArray(res.healed) && res.healed.length > 0) {
           console.log(`[pull] Self-healed: ${res.healed.join("; ")}`);
         }
@@ -421,6 +429,16 @@ async function main() {
       case "rollback": {
         const res = rollback(root);
         console.log(`[rollback] Successfully rolled back ${res.files} file(s) from snapshot ${res.rolledBackFrom}`);
+        break;
+      }
+
+      case "doctor": {
+        const target = options.target ? parseSpec(options.target) : null;
+        const pf = await runPreflight({ root, target, token: options.token ?? null });
+        for (const c of pf.checks) {
+          console.log(`[${c.status.toUpperCase()}] ${c.id}: ${c.detail}`);
+        }
+        if (!pf.ok) process.exitCode = 1;
         break;
       }
 
@@ -742,6 +760,11 @@ async function main() {
         process.exit(1);
     }
   } catch (err) {
+    if (Array.isArray(err?.checks)) {
+      for (const c of err.checks) {
+        console.error(`  [${c.status.toUpperCase()}] ${c.id}: ${c.detail}`);
+      }
+    }
     console.error(`[error] ${err.stack || err.message || err}`);
     process.exit(1);
   }

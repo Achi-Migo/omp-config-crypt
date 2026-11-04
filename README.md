@@ -99,7 +99,15 @@ Configuration exports include the installed `omp-config-crypt` source (excluding
 /config-pull https://… [--dry-run] [--force]
 /config-rollback
 /config-upgrade [--check]
+/config-doctor [gist:<id> | https://…]
 ```
+
+`/config-pull` (and `omp-sync pull`) runs a preflight before downloading: corrupt sync
+metadata is healed in place, an outdated self version is upgraded via npm (restart omp to
+activate), and plugin dependencies missing after the plan are auto-installed and the plan
+recomputed once. Unfixable findings (missing npm, unreachable/wrong target) fail with exact
+next-step commands. `/config-doctor` (or `omp-sync doctor [gist:<id>|https://url]`) runs the
+same checks standalone; exit code 1 when any check fails.
 
 ### Provider control menu
 
