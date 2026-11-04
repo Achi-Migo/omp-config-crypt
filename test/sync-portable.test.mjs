@@ -2876,3 +2876,31 @@ test("44. Cloud transports retry transient network failures", async (t) => {
     else delete process.env.OMP_CONFIG_PASS;
   }
 });
+
+test("45. Blocked sync plan error surfaces action id and reason", async (t) => {
+  const env = makeTempEnv("omp-blocked-detail-");
+  t.after(env.cleanup);
+
+  const rootA = env.a.agent;
+  const skillDir = path.join(rootA, "skills", "shared-search");
+  fs.mkdirSync(skillDir, { recursive: true });
+  fs.writeFileSync(path.join(skillDir, "SKILL.md"), "# Shared\n", "utf8");
+  await setResourceScope(rootA, "asset:skills/shared-search", "public");
+  const { blob } = buildArchive(TEST_PASS, rootA);
+
+  // Client root has a plain file where the archive ships a directory
+  const rootB = env.b.agent;
+  fs.mkdirSync(path.join(rootB, "skills"), { recursive: true });
+  fs.writeFileSync(path.join(rootB, "skills", "shared-search"), "not a dir", "utf8");
+
+  await assert.throws(
+    () => restoreArchive(blob, TEST_PASS, rootB),
+    (err) => {
+      assert.match(err.message, /1 action\(s\) are blocked/);
+      assert.match(err.message, /asset:skills\/shared-search/);
+      assert.match(err.message, /Asset type conversion is blocked/);
+      assert.equal(err.blocked?.length, 1);
+      return true;
+    }
+  );
+});

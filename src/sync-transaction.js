@@ -397,15 +397,21 @@ export function commitFileTransaction(root, transaction, lock) {
 
 export function applySyncPlan(plan, root = configRoot()) {
   if (plan.conflicts && plan.conflicts.length > 0) {
+    const detail = plan.conflicts
+      .map((c) => `${c.id || "(unknown)"}: ${c.reason}`)
+      .join("; ");
     const err = new Error(
-      `Cannot apply sync plan: ${plan.conflicts.length} conflict(s) detected.`
+      `Cannot apply sync plan: ${plan.conflicts.length} conflict(s) detected (${detail}).`
     );
     err.conflicts = plan.conflicts;
     throw err;
   }
   if (plan.blocked && plan.blocked.length > 0) {
+    const detail = plan.blocked
+      .map((b) => `${b.id || "(unknown)"}: ${b.reason}`)
+      .join("; ");
     const err = new Error(
-      `Cannot apply sync plan: ${plan.blocked.length} action(s) are blocked.`
+      `Cannot apply sync plan: ${plan.blocked.length} action(s) are blocked (${detail}).`
     );
     err.blocked = plan.blocked;
     throw err;
