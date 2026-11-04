@@ -5,13 +5,16 @@
  * Operates independently of OMP runtime; zero external dependencies.
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import readline from "node:readline";
 import process from "node:process";
 import {
+  adaptArchive,
   configRoot,
   exportEncrypted,
   importEncrypted,
-  pushGist,
   pullGist,
   pushHttp,
   pullHttp,
@@ -19,6 +22,7 @@ import {
   parseSpec,
   rehydratePlugins,
   probeProvider,
+  inferModelCapabilities,
   saveProvider,
   removeProvider,
   listProviders,
@@ -29,8 +33,13 @@ import {
   getCronStatus,
   installCron,
   removeCron,
+  readSyncPolicy,
+  setResourceScope,
+  resolveResourceScope,
+  inventoryResources,
+  readSyncState,
+  formatSyncReport,
 } from "../index.js";
-
 function printHelp() {
   console.log(`
 Universal OMP Configuration Sync & Crypt Engine (Standalone CLI)
@@ -39,8 +48,11 @@ Usage:
   omp-sync <command> [arguments] [options]
 
 Commands:
+  scope ls / list          List resources with classification, source and reason
+  scope set <id> <scope>   Set resource classification (public or private)
   export <outFile>         Encrypt and export local OMP configs to a file
   import <srcFile>         Decrypt and restore OMP configs from an archive
+  adapt <srcFile> [out]    Adapt legacy v1/v2 archive to current v3 specification
   push <gist:id|url>       Encrypt and push configs to GitHub Gist or HTTP URL
   pull <gist:id|url>       Download and restore configs from Gist or HTTP URL
   rollback                 Revert the most recent config restore from its backup
@@ -52,18 +64,16 @@ Commands:
   provider rm <name>       Remove a provider from public or private store
   role set <role> <ref>    Bind role (default/smol/plan/slow/web) to provider/model
   role ls / list           List active model role mappings
-
 Options:
   -p, --pass <passphrase>  Decryption/Encryption passphrase (or OMP_CONFIG_PASS)
   -t, --token <token>      Cloud token (or OMP_CFG_CLOUD_TOKEN / GITHUB_TOKEN)
   -r, --root <path>        Agent configuration root (default: ~/.omp/agent)
   -d, --dry-run            Simulate restore without modifying files
   -h, --help               Show this help message
-      --no-rehydrate       Skip automatic plugin rehydration on import/pull
-      --rehydrate          Enforce plugin rehydration (default: true)
+
   -u, --url <url>          Endpoint URL for provider (e.g. https://api.openai.com/v1)
   -k, --key <key>          Provider API Key
-      --api <type>         API type: openai-completions (default) | anthropic-messages
+      --api <type>         API type: openai-completions (default) | openai-responses | anthropic-messages
   -m, --model <id>         Model ID to select/bind
       --role <role>        Auto-bind role upon adding (default, smol, plan, slow, web)
       --private            Save as private (local-only, unsynced, non-overwritten) [default]
@@ -90,7 +100,7 @@ function parseCliArgs(argv) {
     token: process.env.OMP_CFG_CLOUD_TOKEN || process.env.GITHUB_TOKEN || null,
     root: process.env.OMP_CFG_ROOT || null,
     dryRun: false,
-    rehydrate: true,
+
     help: false,
     url: null,
     key: null,
@@ -113,10 +123,8 @@ function parseCliArgs(argv) {
       options.dryRun = true;
     } else if (a === "-p" || a === "--pass") {
       options.pass = args[++i];
-    } else if (a === "--no-rehydrate") {
-      options.rehydrate = false;
-    } else if (a === "--rehydrate") {
-      options.rehydrate = true;
+    } else if (a === "--no-rehydrate" || a === "--rehydrate") {
+      throw new Error(`Flag ${a} is not supported; use the independent 'rehydrate' command instead`);
     } else if (a === "-t" || a === "--token") {
       options.token = args[++i];
     } else if (a === "-r" || a === "--root") {
@@ -211,13 +219,80 @@ async function main() {
       : configRoot());
   try {
     switch (options.command) {
+      case "scope": {
+        const sub = (options.target || "list").toLowerCase();
+        if (sub === "list" || sub === "ls") {
+          const policy = readSyncPolicy(root);
+          const state = readSyncState(root);
+          const inventory = inventoryResources(root);
+          if (inventory.length === 0) {
+            console.log("No configuration resources found in current inventory.");
+            break;
+          }
+          console.log("Config Scope Inventory:");
+          for (const item of inventory) {
+            const scopeInfo = resolveResourceScope(item.id, policy, state, item);
+            const badge =
+              scopeInfo.scope === "public"
+                ? "\x1b[32m[PUBLIC]\x1b[0m"
+                : scopeInfo.scope === "private"
+                  ? "\x1b[33m[PRIVATE]\x1b[0m"
+                  : "\x1b[36m[UNCLASSIFIED]\x1b[0m";
+            console.log(
+              `  ${badge} ${item.id.padEnd(35)} (source: ${item.sourceRel}, reason: ${scopeInfo.reason})`
+            );
+          }
+          break;
+        }
+        if (sub === "set") {
+          const id = options.positional[2];
+          const scope = options.positional[3]?.toLowerCase();
+          if (!id || !scope || (scope !== "public" && scope !== "private")) {
+            throw new Error(
+              "Usage: omp-sync scope set <resource-id> <public|private>"
+            );
+          }
+          const res = await setResourceScope(root, id, scope);
+          console.log(`[scope] ✓ Set scope for '${res.id}' to '${res.scope}'`);
+          if (res.warning) {
+            console.log(`[scope] Notice: ${res.warning}`);
+          }
+          break;
+        }
+        throw new Error(`Unknown scope subcommand: ${sub}. Allowed: list, set.`);
+      }
+
       case "export": {
         if (!options.target) {
           throw new Error("Usage: omp-sync export <outFile> [options]");
         }
         const pass = await resolvePass(options.pass);
         const res = exportEncrypted(options.target, pass, root);
-        console.log(`[export] Successfully exported ${res.files} files (${res.bytes} bytes) -> ${res.outFile}`);
+        console.log(`[export] Successfully exported ${res.files} public resource(s) (${res.bytes} bytes) -> ${res.outFile}`);
+        break;
+      }
+
+      case "adapt": {
+        if (!options.target) {
+          throw new Error("Usage: omp-sync adapt <srcFile> [outFile] [options]");
+        }
+        const srcFile = path.resolve(options.target);
+        const outFile = path.resolve(
+          options.positional[2] || `${options.target}.v3.enc`
+        );
+        if (srcFile === outFile) {
+          throw new Error("cannot overwrite source file");
+        }
+        if (fs.existsSync(outFile) && !options.force) {
+          throw new Error(`adapted archive already exists: ${outFile}`);
+        }
+        const pass = await resolvePass(options.pass);
+        const srcBlob = fs.readFileSync(srcFile);
+        const res = adaptArchive(srcBlob, pass);
+        fs.writeFileSync(outFile, res.blob, { mode: 0o600 });
+        console.log(
+          `[adapt] detected v${res.legacy.from}; wrote v3 archive -> ${outFile} (${res.payload.resources.length} resources, ${res.legacy.unmapped.length} unmapped)`
+        );
         break;
       }
 
@@ -228,25 +303,21 @@ async function main() {
         const pass = await resolvePass(options.pass);
         const res = importEncrypted(options.target, pass, root, {
           dryRun: options.dryRun,
-          rehydrate: options.rehydrate,
         });
+        if (res.adaptedFile) {
+          console.log(`[import] incompatible v${res.legacy?.from}; adapted -> ${res.adaptedFile}`);
+        }
+
         if (options.dryRun) {
-          console.log(`[import-dry-run] Would restore ${res.files} files (0 written to disk).`);
-          for (const act of res.actions) {
-            console.log(`  - ${act.path} -> ${act.dest}${act.remapped ? " [path remapped]" : ""}`);
+          console.log(`[import-dry-run] Planned physical writes: ${res.files}`);
+          console.log(formatSyncReport(res));
+          if ((res.conflicts && res.conflicts.length > 0) || (res.blocked && res.blocked.length > 0)) {
+            process.exit(1);
           }
         } else {
-          console.log(`[import] Successfully restored ${res.files} files to ${root}.`);
+          console.log(`[import] Successfully applied sync. Modified ${res.files} physical file(s) in ${root}.`);
           if (res.backupDir) {
             console.log(`[backup] Pre-existing files backed up to: ${res.backupDir}`);
-          }
-          if (res.rehydration) {
-            console.log(
-              `[rehydrate] Plugins processed: ${res.rehydration.rehydrated} rehydrated (installed: ${res.rehydration.npmInstalled.length}, links: ${res.rehydration.linksRepaired.length}).`
-            );
-          }
-          if (res.purged && res.purged.length > 0) {
-            console.log(`[cleanup] Automatically purged ${res.purged.length} obsolete file(s) (e.g. legacy agy.js).`);
           }
         }
         break;
@@ -264,7 +335,7 @@ async function main() {
             ? await pushGist(target.id, pass, root, token)
             : await pushHttp(target.url, pass, root, token);
 
-        console.log(`[push] Successfully pushed ${res.files} files (${res.bytes} bytes).`);
+        console.log(`[push] Successfully pushed ${res.files} public resource(s) (${res.bytes} bytes).`);
         if (res.url) {
           console.log(`[url] Gist URL: ${res.url}`);
         }
@@ -283,26 +354,42 @@ async function main() {
         const token = await resolveToken(options.token, target.kind === "gist");
         const res =
           target.kind === "gist"
-            ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun, rehydrate: options.rehydrate })
-            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun, rehydrate: options.rehydrate });
+            ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun })
+            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun });
+        if (res.adaptedFile) {
+          console.log(`[pull] incompatible v${res.legacy?.from}; adapted -> ${res.adaptedFile}`);
+        }
 
         if (options.dryRun) {
-          console.log(`[pull-dry-run] Would restore ${res.files} files (0 written to disk).`);
+          console.log(`[pull-dry-run] Planned actions for ${res.actions.length} resource(s) (0 written to disk):`);
           for (const act of res.actions) {
-            console.log(`  - ${act.path} -> ${act.dest}${act.remapped ? " [path remapped]" : ""}`);
+            console.log(`  - [${act.action.toUpperCase()}] ${act.id} (${act.reason}) -> ${act.targetPath}`);
+          }
+          if (res.conflicts && res.conflicts.length > 0) {
+            console.error(`[pull-dry-run] Conflicts (${res.conflicts.length}):`);
+            for (const c of res.conflicts) {
+              console.error(`  ! ${c.id}: ${c.reason} (${c.targetPath})`);
+            }
+          }
+          if (res.blocked && res.blocked.length > 0) {
+            console.error(`[pull-dry-run] Blocked actions (${res.blocked.length}):`);
+            for (const b of res.blocked) {
+              console.error(`  X ${b.id}: ${b.reason}`);
+            }
+          }
+          if (res.prerequisites && res.prerequisites.length > 0) {
+            console.log("[pull-dry-run] Prerequisites required before apply:");
+            for (const p of res.prerequisites) {
+              console.log(`  * ${p}`);
+            }
+          }
+          if (res.conflicts.length > 0 || res.blocked.length > 0) {
+            process.exit(1);
           }
         } else {
-          console.log(`[pull] Successfully restored ${res.files} files to ${root}.`);
+          console.log(`[pull] Successfully restored ${res.files} physical file(s) in ${root}.`);
           if (res.backupDir) {
             console.log(`[backup] Pre-existing files backed up to: ${res.backupDir}`);
-          }
-          if (res.rehydration) {
-            console.log(
-              `[rehydrate] Plugins processed: ${res.rehydration.rehydrated} rehydrated (installed: ${res.rehydration.npmInstalled.length}, links: ${res.rehydration.linksRepaired.length}).`
-            );
-          }
-          if (res.purged && res.purged.length > 0) {
-            console.log(`[cleanup] Automatically purged ${res.purged.length} obsolete file(s) (e.g. legacy agy.js).`);
           }
         }
         break;
@@ -310,7 +397,7 @@ async function main() {
 
       case "rollback": {
         const res = rollback(root);
-        console.log(`[rollback] Successfully rolled back ${res.files} files from snapshot ${res.rolledBackFrom}`);
+        console.log(`[rollback] Successfully rolled back ${res.files} file(s) from snapshot ${res.rolledBackFrom}`);
         break;
       }
 
@@ -428,6 +515,12 @@ async function main() {
           if (!name) {
             throw new Error("Usage: omp-sync provider remove <name>");
           }
+          const roles = Object.entries(getRoles(root))
+            .filter(([, ref]) => ref.startsWith(`${name}/`))
+            .map(([r]) => r);
+          if (roles.length && !options.force) {
+            throw new Error(`Provider '${name}' is bound to role(s): ${roles.join(", ")}. Rebind roles first or use --force.`);
+          }
           const removed = removeProvider({ name, agentDir: root });
           if (removed) {
             console.log(`[provider] ✓ Removed provider '${name}'`);
@@ -475,7 +568,12 @@ async function main() {
               isPrivate = true; // Default to private for safety
             }
           }
+          if (!["openai-completions", "openai-responses", "anthropic-messages"].includes(options.api)) {
+            // Reject unknown protocols even when an explicit model permits manual saving.
+            throw new Error(`Unknown API: ${options.api}`);
+          }
 
+          url = url.trim().replace(/\/+$/, "");
           console.log(`[probe] Probing endpoint ${url}...`);
           const probed = await probeProvider({
             baseUrl: url,
@@ -490,8 +588,9 @@ async function main() {
             if (!options.model) {
               throw new Error("Probe failed and no fallback --model specified. Aborted.");
             }
+            console.log("[probe] Saving explicit model without connection verification.");
           } else {
-            console.log(`[probe] ✓ Endpoint verified: ${probed.normalizedBaseUrl} (${probed.api})`);
+            console.log(`[probe] ✓ Model catalog found (generation not verified): ${probed.normalizedBaseUrl} (${probed.api})`);
             console.log(`[probe] ✓ Discovered ${probed.models.length} model(s)`);
           }
 
@@ -535,12 +634,15 @@ async function main() {
 
           const models = probed.ok && probed.models.length > 0
             ? probed.models
-            : [{ id: options.model || "custom-model", name: `${name} custom model`, contextWindow: 128000, maxTokens: 32000 }];
+            : [inferModelCapabilities(options.model, name)];
+          if (options.model && !models.some(model => model.id === options.model)) {
+            models.push(inferModelCapabilities(options.model, name));
+          }
 
           saveProvider({
             name,
             providerConfig: {
-              baseUrl: probed.ok ? probed.normalizedBaseUrl : url,
+              baseUrl: probed.ok ? probed.normalizedBaseUrl : options.api === "anthropic-messages" ? url.replace(/\/+$/, "").replace(/\/v1$/i, "") : url,
               api: probed.ok ? probed.api : options.api,
               apiKey: key,
               models,

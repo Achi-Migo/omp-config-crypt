@@ -36,5 +36,8 @@
     "extensions": [
       "./index.js"
     ]
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
   }
 }

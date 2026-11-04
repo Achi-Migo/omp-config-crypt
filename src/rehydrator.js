@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
-import { ompHome } from "../index.js";
+import { ompHome } from "./sync-files.js";
 
 const LINKS_FILE = ".plugin-links.json";
 

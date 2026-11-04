@@ -17,7 +17,7 @@ Supports both **in-OMP slash commands** and an **independent standalone CLI (`om
 3. **Comprehensive Asset Synchronization**:
    - **Core Configs**: `config.yml`, `models.yml`, `mcp.json`, `AGENTS.md`, `STYLE.md`, `RULES.md`.
    - **Credentials & Tokens**: Automatic discovery and encryption of `opc-mcp-token` and `*.token` files.
-   - **User Extensions**: Full recursive synchronization of `~/.omp/extensions/**` (e.g. `agy.js`).
+   - **User Extensions**: Native `~/.omp/agent/extensions/**` plus supported legacy extension assets.
    - **Skills & Knowledge**: Recursive sync of `managed-skills/**` and `memories/**`.
    - **Plugins Manifest**: Syncs `plugins/omp-plugins.lock.json` for deterministic plugin tracking.
    - **Strict Blacklist**: Automatically excludes SQLite runtime databases (`*.db`, `*.db-wal`, `*.db-shm`), session logs, and cache folders.
@@ -67,6 +67,10 @@ npx omp-config-crypt role set smol my-provider/gpt-4o-mini
 
 Inside any `omp` session:
 
+Tab completion preserves existing arguments for `/provider edit|test|rm|remove`, provider options, and `/role <role> <provider/model>`; selecting a provider after `/provider edit ` inserts its name without replacing `edit`.
+
+Configuration exports include the installed `omp-config-crypt` source (excluding nested dependencies), preserving local provider/role fixes and sync-engine changes on restore. Native extensions and global tools are included as well. Restart OMP after restoring; a later npm/plugin upgrade can overwrite local plugin changes.
+
 ```text
 /config-export [out.enc]
 /config-import <file.enc> [--dry-run]
@@ -77,6 +81,57 @@ Inside any `omp` session:
 /config-pull https://… [--dry-run]
 /config-rollback
 ```
+
+### Provider control menu
+
+Run `/provider` in an interactive OMP session for the native keyboard menu (↑↓ / Enter / Esc).
+Add selects OpenAI (`openai-completions` or `openai-responses`) or Anthropic (`anthropic-messages`),
+then URL, masked Key and PRIVATE/PUBLIC scope. Models come from the endpoint catalog, local
+registry/configuration hints, a fixed popular-candidate list, then manual IDs. Recommendations
+are offline hints, not availability claims or a live ranking. Each stage tests every unique
+candidate with the selected URL, Key and protocol before showing selectable models (two requests
+at most concurrently, ten seconds per request, no automatic retries; requests may incur charges).
+Only successful models appear in the native multi-select: Space toggles, Enter confirms the
+checked subset, Esc returns to source actions. Other/manual IDs also require generation checks.
+Progress and model rows show full short-generation latency in milliseconds, including the final
+stream event. Esc during discovery or testing cancels acquisition. A supported native askDialog
+host is required. The local registry is read without refreshing it or accessing other credentials.
+Manage existing providers to view details, edit a draft, verify a selected model, or confirm deletion.
+Role-bound providers must be rebound through `/role` before deletion (both in interactive UI and non-UI
+slash command `/provider rm <name>`, preventing dangling role references in `config.yml`; `omp-sync provider rm`
+requires `--force` if role-bound). Unbound providers remain fully compatible with headless script deletion.
+
+`/provider ls|list` remains a text list. `/provider add|wizard`, `/provider edit <name>`,
+`/provider test <name>`, and `/provider rm|remove <name>` open the relevant interactive flow.
+Without UI, use `/provider add <name> <url> [key] [--api <type>] [--model <id>] [--private|--public]`.
+Protocol defaults to `openai-completions`; flags never become the Key. Edit and test require UI.
+
+Discovery alone does **not** verify generation. Interactive add and edit model acquisition are unified:
+both require candidate verification via real short generations with clear billing/cost notice before multi-select.
+Existing model custom parameters (e.g., `contextWindow`, `maxTokens`, `compat`, `reasoning`) are preserved when
+re-selected. Cancelling acquisition performs zero writes to the draft. If protocol, Base URL, or Key is modified
+in the draft, cached model checks are invalidated immediately, preventing unverified saves.
+`filterChatModels` excludes non-chat image/video generation models (e.g. Sora, Kling, CogVideo, Runway, Luma,
+Pika, Vidu, Wanx, SDXL, Imagen, Ideogram, Kolors, `*-image`, `*-video`) while strictly preserving vision chat models.
+The summary supports rechecking all selected models; failed, cancelled or unstarted rechecks cannot inherit
+previous successes. Check results, source labels and latency remain in memory and are not saved. `/provider test`
+checks one model and reports its latency; it does not claim the entire provider is verified.
+Draft cancellation does not write; saved changes load after restarting OMP.
+PRIVATE is the default and is excluded by encrypted-sync filtering; PUBLIC includes credentials
+in encrypted synchronization. Private providers remain mirrored in both existing stores.
+Background maintenance preserves the active `models.local.json` store; only obsolete root-level
+extension files remain eligible for legacy cleanup.
+The generated private loader lives at `~/.omp/agent/extensions/local-models.js`; existing loaders
+and legacy files are not overwritten or removed. Invalid private JSON and public YAML fields
+unsupported by the fixed-field formatter reject writes rather than silently discard configuration.
+
+Standalone Responses example:
+`omp-sync provider add gateway --url https://example.com/v1 --key YOUR_KEY --api openai-responses --model MODEL_ID --private --non-interactive`.
+If discovery fails, an explicit `--model` can still be saved, clearly marked unverified.
+
+**Notice on Updates:** This installed package contains local fixes and patches. Upstream updates, running
+`omp plugin upgrade`, `omp update`, or `npm update` can overwrite local installation patches. If updated,
+re-verify or restore your configured extensions and sync scripts.
 
 ---
 
@@ -89,6 +144,16 @@ Inside any `omp` session:
 | `GITHUB_TOKEN` | Fallback GitHub API token |
 | `OMP_CFG_ROOT` | Override path to agent directory (default: `~/.omp/agent`) |
 | `OMP_HOME` | Override path to omp root (default: `~/.omp`) |
+
+### Network troubleshooting
+
+Gist/HTTP transports retry transient network failures (ECONNRESET, ETIMEDOUT, 429, 5xx) up to 3 times
+with backoff; 4xx client errors fail immediately. Node's `fetch` ignores the OS proxy and `HTTPS_PROXY`
+by default. On unstable routes to `api.github.com`, launch with:
+
+```
+NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:<port>   # local proxy (HTTP or mixed port)
+```
 
 ---
 

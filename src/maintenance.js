@@ -43,6 +43,23 @@ export function pruneOldBackups(agentDir, keepCount = 3) {
   const pruned = [];
   if (!fs.existsSync(agentDir)) return pruned;
 
+  const recoveryLock = path.join(agentDir, ".sync-recovery.local.lock");
+  if (fs.existsSync(recoveryLock)) return pruned;
+
+  let activeBackup = null;
+  const lockPath = path.join(agentDir, ".sync.local.lock");
+  if (fs.existsSync(lockPath)) {
+    try {
+      const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      if (typeof lock?.backupDir === "string" && lock.backupDir) {
+        activeBackup = lock.backupDir;
+      }
+    } catch {
+      // Corrupt lock: do not prune anything that might still be referenced.
+      return pruned;
+    }
+  }
+
   const entries = fs.readdirSync(agentDir, { withFileTypes: true });
   const backups = entries
     .filter((e) => e.isDirectory() && e.name.startsWith(".import-backup-"))
@@ -50,8 +67,20 @@ export function pruneOldBackups(agentDir, keepCount = 3) {
     .sort()
     .reverse();
 
-  if (backups.length > keepCount) {
-    const toRemove = backups.slice(keepCount);
+  const eligibleBackups = backups.filter((name) => {
+    if (activeBackup && name === activeBackup) return false;
+    const journalFile = path.join(agentDir, name, "journal.json");
+    if (!fs.existsSync(journalFile)) return false;
+    try {
+      const journal = JSON.parse(fs.readFileSync(journalFile, "utf8"));
+      return journal?.status === "completed";
+    } catch {
+      return false;
+    }
+  });
+
+  if (eligibleBackups.length > keepCount) {
+    const toRemove = eligibleBackups.slice(keepCount);
     for (const name of toRemove) {
       const fullPath = path.join(agentDir, name);
       try {
@@ -69,7 +98,6 @@ export function pruneOldBackups(agentDir, keepCount = 3) {
 export function cleanObsoleteFiles(agentDir) {
   const ompDir = getOmpHome(agentDir);
   const targets = [
-    path.join(agentDir, "models.local.json"),
     path.join(ompDir, "extensions", "local-models.js"),
     path.join(ompDir, "extensions", "agy.js"),
   ];
