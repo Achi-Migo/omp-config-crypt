@@ -231,10 +231,20 @@ export function ensureLocalExtension(ompDir) {
  */
 export function parseYamlModels(str) {
   if (!str || typeof str !== "string") return {};
-  const providers = parseBlockYamlModels(str);
-  if (Object.keys(providers).length) return providers;
-  // Flow-style (brace/bracket) YAML: delegate to the yaml package.
-  return parseFlowYamlModels(str);
+  // Prefer the yaml package: handles flow-style (braces) and block-list values
+  // (e.g. `input:` followed by `- text` lines) the line parser cannot.
+  const parsed = normalizeProviderInputs(parseFlowYamlModels(str));
+  if (Object.keys(parsed).length) return parsed;
+  return normalizeProviderInputs(parseBlockYamlModels(str));
+}
+
+function normalizeProviderInputs(providers) {
+  for (const cfg of Object.values(providers || {})) {
+    for (const model of cfg?.models || []) {
+      if (typeof model.input === "string" && model.input) model.input = [model.input];
+    }
+  }
+  return providers;
 }
 
 function parseFlowYamlModels(str) {
@@ -608,6 +618,7 @@ function scanBlockSource(text) {
     if (section === "models" || section === "model" || section === "compat") {
       if (indent === 6 && trimmed.startsWith("- ") && field === "id") { section = "model"; continue; }
       if (indent === 8 && MODEL_FIELDS.has(field)) { section = field === "compat" ? "compat" : "model"; continue; }
+      if (section === "model" && indent === 10 && trimmed.startsWith("- ")) continue;
       if (indent === 10 && section === "compat" && /^[A-Za-z0-9_-]+:\s*\S/.test(trimmed)) continue;
     }
     unsupported(`${provider || "root"}.${field}`);
