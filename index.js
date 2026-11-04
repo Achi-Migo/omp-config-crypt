@@ -146,6 +146,8 @@ export {
 };
 
 const MAGIC = Buffer.from("OMPCFG1\0", "latin1");
+// Pinned to Node's historical defaults so archives stay decryptable across Node versions.
+const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
 
 /**
  * Collect is now defined strictly as the read-only file projection of public resources.
@@ -286,7 +288,7 @@ export function decryptArchiveBlob(blob, pass) {
   const iv = blob.subarray(o, (o += 12));
   const tag = blob.subarray(o, (o += 16));
   const ct = blob.subarray(o);
-  const key = scryptSync(pass, salt, 32);
+  const key = scryptSync(pass, salt, 32, SCRYPT_PARAMS);
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
 
@@ -308,7 +310,7 @@ export function encryptArchivePayload(payload, pass) {
   const plain = gzipSync(Buffer.from(JSON.stringify(payload)), { level: 9 });
   const salt = randomBytes(16);
   const iv = randomBytes(12);
-  const key = scryptSync(pass, salt, 32);
+  const key = scryptSync(pass, salt, 32, SCRYPT_PARAMS);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
   return Buffer.concat([MAGIC, salt, iv, cipher.getAuthTag(), ct]);

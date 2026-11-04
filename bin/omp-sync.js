@@ -712,7 +712,7 @@ async function main() {
         process.exit(1);
     }
   } catch (err) {
-    console.error(`[error] ${err.message || err}`);
+    console.error(`[error] ${err.stack || err.message || err}`);
     process.exit(1);
   }
 }

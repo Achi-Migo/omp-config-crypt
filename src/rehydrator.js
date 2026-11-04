@@ -7,6 +7,16 @@ import { ompHome } from "./sync-files.js";
 const LINKS_FILE = ".plugin-links.json";
 
 /**
+ * npm on Windows is npm.cmd; spawning .cmd files requires shell:true (Node CVE-2024-27980).
+ * Args are validated snapshot-derived constants, so no shell metacharacters can appear.
+ */
+export function resolveNpmCommand() {
+  return process.platform === "win32"
+    ? { file: "npm.cmd", shell: true }
+    : { file: "npm", shell: false };
+}
+
+/**
  * Scan plugins directory node_modules for symlinks and return a map of name -> targetPath.
  */
 export function getPluginLinks(pluginsDir) {
@@ -145,10 +155,12 @@ export function rehydratePlugins(root, options = {}) {
       results.npmInstalled.push(...missing.npmDependencies);
     } else {
       try {
-        execFileSync("npm", ["install", "--omit=dev", "--no-audit", "--no-fund"], {
+        const npmCmd = resolveNpmCommand();
+        execFileSync(npmCmd.file, ["install", "--omit=dev", "--no-audit", "--no-fund"], {
           cwd: pluginsDir,
           stdio: "pipe",
           timeout: 60000,
+          shell: npmCmd.shell,
         });
         results.npmInstalled.push(...missing.npmDependencies);
       } catch (err) {
@@ -165,11 +177,18 @@ export function rehydratePlugins(root, options = {}) {
     } catch {}
   }
 
-  // Known candidate fallback directories for common local plugins
+  // Known candidate fallback directories for common local plugins.
+  // Extra dev roots come from OMP_PLUGIN_DEV_DIRS (path.delimiter-separated); no host-specific paths.
+  const devRoots = (process.env.OMP_PLUGIN_DEV_DIRS || "")
+    .split(path.delimiter)
+    .filter(Boolean);
   const candidateDirs = {
-    "@omp/plugin-rsi": ["/opt/project/omp-rsi", path.join(os.homedir(), "omp-rsi")],
-    "omp-config-crypt": ["/root/omp-config-crypt", path.join(os.homedir(), "omp-config-crypt")],
+    "@omp/plugin-rsi": [path.join(os.homedir(), "omp-rsi")],
+    "omp-config-crypt": [path.join(os.homedir(), "omp-config-crypt")],
   };
+  for (const [name, dirs] of Object.entries(candidateDirs)) {
+    for (const root of devRoots) dirs.push(path.join(root, name));
+  }
 
   // 3. Resolve and repair linked plugins
   const pluginsToLink = Array.from(
@@ -197,10 +216,12 @@ export function rehydratePlugins(root, options = {}) {
     if (!targetDir || !fs.existsSync(targetDir)) {
       if (!dryRun) {
         try {
-          execFileSync("npm", ["install", `${name}@latest`, "--omit=dev", "--no-audit", "--no-fund"], {
+          const npmCmd = resolveNpmCommand();
+          execFileSync(npmCmd.file, ["install", `${name}@latest`, "--omit=dev", "--no-audit", "--no-fund"], {
             cwd: pluginsDir,
             stdio: "pipe",
             timeout: 60000,
+            shell: npmCmd.shell,
           });
           results.npmInstalled.push(name);
           continue;

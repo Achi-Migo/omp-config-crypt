@@ -25,7 +25,7 @@ function fileSha256(bufOrStr) {
 }
 
 function ensureDir(abs) {
-  if (!fs.existsSync(abs)) fs.mkdirSync(abs, { recursive: true });
+  if (!fs.existsSync(abs)) fs.mkdirSync(abs, { recursive: true, mode: 0o700 });
 }
 
 function fsyncPath(abs) {
@@ -222,7 +222,7 @@ function ensureParents(abs, createdDirectories) {
     probe = path.dirname(probe);
   }
   for (const dir of stack.reverse()) {
-    fs.mkdirSync(dir);
+    fs.mkdirSync(dir, { mode: 0o700 });
     createdDirectories.push(dir);
   }
 }
@@ -373,6 +373,10 @@ export function commitFileTransaction(root, transaction, lock) {
     journal.status = "completed";
     writeJournalAtomic(journalPath, journal);
 
+    try {
+      pruneBackups(agentDir);
+    } catch {}
+
     return {
       success: true,
       filesWritten: journal.entries.filter((entry) => entry.rel !== STATE_FILE).length,
@@ -444,6 +448,20 @@ function acquireRecoveryLock(root) {
       fs.unlinkSync(recoveryPath);
     } catch {}
   };
+}
+
+/**
+ * Removes all but the newest `keep` .import-backup-* directories (name-sorted, oldest first).
+ */
+export function pruneBackups(agentDir, keep = 3) {
+  const backups = fs
+    .readdirSync(agentDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(".import-backup-"))
+    .map((entry) => entry.name)
+    .sort();
+  for (const name of backups.slice(0, Math.max(0, backups.length - keep))) {
+    fs.rmSync(path.join(agentDir, name), { recursive: true, force: true });
+  }
 }
 
 function loadLatestJournal(agentDir) {

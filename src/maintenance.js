@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { exec, execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { exec, execSync, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
@@ -226,9 +227,19 @@ export function getCronStatus() {
 }
 
 /**
+ * A valid cron schedule is exactly 5 whitespace-separated fields of digits, *, -, /, comma.
+ */
+export function validateCronSchedule(s) {
+  return /^[\d*,\-/]+(?: [\d*,\-/]+){4}$/.test(String(s ?? ""));
+}
+
+/**
  * Install scheduled maintenance into system crontab.
  */
 export function installCron(schedule = "0 3 * * *", command = null) {
+  if (!validateCronSchedule(schedule)) {
+    throw new Error("invalid cron schedule: expected 5 fields of digits, *, -, /, comma");
+  }
   try {
     let current = "";
     try {
@@ -239,7 +250,15 @@ export function installCron(schedule = "0 3 * * *", command = null) {
     const cmd = command || "npx -y omp-config-crypt maint --force > /dev/null 2>&1";
     lines.push(`${schedule} ${cmd} ${CRON_TAG}`);
 
-    execSync(`(echo "${lines.join("\n")}") | crontab -`);
+    const tmp = path.join(os.tmpdir(), `omp-crontab-${randomUUID()}`);
+    fs.writeFileSync(tmp, `${lines.join("\n")}\n`, { mode: 0o600 });
+    try {
+      execFileSync("crontab", [tmp], { stdio: "pipe" });
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+    }
     return { success: true, schedule, command: cmd };
   } catch (err) {
     return { success: false, error: err.message };
@@ -258,7 +277,15 @@ export function removeCron() {
 
     const lines = current.split("\n").filter((l) => !l.includes(CRON_TAG) && l.trim().length > 0);
     if (lines.length > 0) {
-      execSync(`(echo "${lines.join("\n")}") | crontab -`);
+      const tmp = path.join(os.tmpdir(), `omp-crontab-${randomUUID()}`);
+      fs.writeFileSync(tmp, `${lines.join("\n")}\n`, { mode: 0o600 });
+      try {
+        execFileSync("crontab", [tmp], { stdio: "pipe" });
+      } finally {
+        try {
+          fs.unlinkSync(tmp);
+        } catch {}
+      }
     } else {
       execSync("crontab -r 2>/dev/null || true");
     }

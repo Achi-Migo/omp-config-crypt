@@ -738,11 +738,12 @@ export function planSync(snapshot, root = configRoot()) {
   try {
     localNamespace = resolveSyncNamespace(policy, state);
   } catch (error) {
-    blocked.push({ reason: error.message });
+    blocked.push({ id: "namespace", reason: error.message });
     return { namespace: validSnapshot.namespace, actions: [], conflicts: [], blocked, prerequisites: [], writes: {} };
   }
   if (localNamespace && localNamespace !== validSnapshot.namespace) {
     blocked.push({
+      id: "namespace",
       reason: `Namespace mismatch: remote is '${validSnapshot.namespace}', local is '${localNamespace}'. Cannot take over different configuration set.`,
     });
     return { namespace: validSnapshot.namespace, actions: [], conflicts: [], blocked, prerequisites: [], writes: {} };

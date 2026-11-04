@@ -510,6 +510,32 @@ export function isPidAlive(pid) {
   }
 }
 
+const TERMINAL_JOURNAL_STATUSES = new Set(["completed", "rolled_back"]);
+
+/**
+ * True when any .import-backup-* dir holds a journal that is missing, unreadable,
+ * or non-terminal — i.e. a crashed transaction that still needs rollback, not lock removal.
+ */
+function hasUnfinishedJournal(agentDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(agentDir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(".import-backup-")) continue;
+    let journal;
+    try {
+      journal = JSON.parse(fs.readFileSync(path.join(agentDir, entry.name, "journal.json"), "utf8"));
+    } catch {
+      return true;
+    }
+    if (!TERMINAL_JOURNAL_STATUSES.has(journal.status)) return true;
+  }
+  return false;
+}
+
 export function withSyncLock(root, operation, options = {}) {
   const agentDir = path.resolve(root);
   if (!fs.existsSync(agentDir)) fs.mkdirSync(agentDir, { recursive: true });
@@ -529,9 +555,28 @@ export function withSyncLock(root, operation, options = {}) {
         `Sync lock could not be created at ${lockPath}: permission denied (${error.code}). Check directory ACL/permissions; manual recovery may be required.`
       );
     }
-    throw new Error(
-      `Sync lock active at ${lockPath}. Another sync may be running, or a previous sync failed. Run rollback or remove lock if stale.`
-    );
+    // EEXIST (usual case): recover from a stale lock left behind by an exited process,
+    // but only when no unfinished transaction journal exists (crash recovery stays manual).
+    let stale = false;
+    try {
+      const record = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      if (record && record.pid != null && !isPidAlive(record.pid) && !hasUnfinishedJournal(agentDir)) {
+        stale = true;
+      }
+    } catch {}
+    if (!stale) {
+      throw new Error(
+        `Sync lock active at ${lockPath}. Another sync may be running, or a previous sync failed. Run rollback or remove lock if stale.`
+      );
+    }
+    try {
+      fs.unlinkSync(lockPath);
+      fd = fs.openSync(lockPath, "wx");
+    } catch {
+      throw new Error(
+        `Sync lock active at ${lockPath}. Another sync may be running, or a previous sync failed. Run rollback or remove lock if stale.`
+      );
+    }
   }
 
   const content = {

@@ -46,6 +46,9 @@ import pluginEntry from "../index.js";
 import { parseYamlStrict } from "../src/sync-resources.js";
 import { getSyncPlanTransaction } from "../src/sync-plan.js";
 import { withSyncLock } from "../src/sync-files.js";
+import { pruneBackups } from "../src/sync-transaction.js";
+import { installCron, validateCronSchedule } from "../src/maintenance.js";
+import { resolveNpmCommand } from "../src/rehydrator.js";
 
 const TEST_PASS = "TestPassword_12345!";
 const MAGIC = Buffer.from("OMPCFG1\0", "latin1");
@@ -2903,4 +2906,127 @@ test("45. Blocked sync plan error surfaces action id and reason", async (t) => {
       return true;
     }
   );
+});
+
+test("46. Stale lock from an exited process is auto-recovered by withSyncLock", (t) => {
+  const env = makeTempEnv("omp-stale-lock-");
+  t.after(env.cleanup);
+
+  const exited = spawnSync(process.execPath, ["-e", ""], { encoding: "utf8" });
+  assert.ok(Number.isInteger(exited.pid));
+  const lockPath = path.join(env.a.agent, ".sync.local.lock");
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({
+      version: 1,
+      transactionId: "stale",
+      pid: exited.pid,
+      createdAt: new Date().toISOString(),
+      backupDir: null,
+    })
+  );
+
+  const result = withSyncLock(env.a.agent, () => "ok");
+  assert.equal(result, "ok");
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
+test("47. Lock held by a live pid is still rejected", (t) => {
+  const env = makeTempEnv("omp-live-lock-");
+  t.after(env.cleanup);
+
+  const lockPath = path.join(env.a.agent, ".sync.local.lock");
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({
+      version: 1,
+      transactionId: "live",
+      pid: process.pid,
+      createdAt: new Date().toISOString(),
+      backupDir: null,
+    })
+  );
+
+  assert.throws(() => withSyncLock(env.a.agent, () => "ok"), /Sync lock active/);
+  assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).transactionId, "live");
+});
+
+test("48. pruneBackups keeps only the newest backups in name order", (t) => {
+  const env = makeTempEnv("omp-prune-backups-");
+  t.after(env.cleanup);
+
+  const dir = env.a.agent;
+  for (let i = 0; i < 5; i++) {
+    const name = `.import-backup-0000${i}`;
+    fs.mkdirSync(path.join(dir, name), { recursive: true });
+    fs.writeFileSync(path.join(dir, name, "marker.txt"), String(i), "utf8");
+  }
+
+  pruneBackups(dir);
+  const left = fs
+    .readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith(".import-backup-"))
+    .map((e) => e.name)
+    .sort();
+  assert.deepEqual(left, [".import-backup-00002", ".import-backup-00003", ".import-backup-00004"]);
+  assert.equal(fs.readFileSync(path.join(dir, ".import-backup-00002", "marker.txt"), "utf8"), "2");
+});
+
+test("49. validateCronSchedule and installCron reject injection and malformed schedules", () => {
+  assert.equal(validateCronSchedule("0 3 * * *"), true);
+  assert.equal(validateCronSchedule("*/5 1-6 * * 1,3,5"), true);
+  assert.equal(validateCronSchedule("* * * * *; touch /tmp/pwn"), false);
+  assert.equal(validateCronSchedule("0 3 * *"), false);
+  assert.equal(validateCronSchedule("0 3 * * * && rm -rf /"), false);
+  assert.equal(validateCronSchedule(""), false);
+  assert.equal(validateCronSchedule(null), false);
+  assert.throws(() => installCron("bad sched"), /invalid cron schedule/);
+});
+
+test("50. Explicit scrypt params derive keys identical to Node defaults", () => {
+  const pass = TEST_PASS;
+  const salt = Buffer.from("0123456789abcdef");
+  const byDefault = scryptSync(pass, salt, 32);
+  const byParams = scryptSync(pass, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+  assert.ok(Buffer.isBuffer(byDefault));
+  assert.ok(byDefault.equals(byParams));
+});
+
+test("51. Namespace mismatch surfaces blocked entry id 'namespace'", async (t) => {
+  const env = makeTempEnv("omp-ns-id-");
+  t.after(env.cleanup);
+
+  fs.writeFileSync(
+    path.join(env.a.agent, "models.yml"),
+    "providers:\n  demo:\n    baseUrl: https://v1.example\n    apiKey: v1\n"
+  );
+  await setResourceScope(env.a.agent, "provider:demo", "public");
+  const { blob } = buildArchive(TEST_PASS, env.a.agent);
+
+  fs.writeFileSync(
+    path.join(env.b.agent, "models.yml"),
+    "providers:\n  local:\n    baseUrl: https://v9.example\n    apiKey: local\n"
+  );
+  await setResourceScope(env.b.agent, "provider:local", "public");
+
+  await assert.throws(
+    () => restoreArchive(blob, TEST_PASS, env.b.agent),
+    (err) => {
+      assert.match(err.message, /namespace: Namespace mismatch/);
+      assert.equal(err.blocked?.length, 1);
+      assert.equal(err.blocked[0].id, "namespace");
+      return true;
+    }
+  );
+});
+
+test("52. resolveNpmCommand maps win32 to npm.cmd with shell", () => {
+  const original = Object.getOwnPropertyDescriptor(process, "platform").value;
+  try {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    assert.deepEqual(resolveNpmCommand(), { file: "npm.cmd", shell: true });
+  } finally {
+    Object.defineProperty(process, "platform", { value: original, configurable: true });
+  }
+  assert.deepEqual(resolveNpmCommand(), { file: "npm", shell: false });
 });
