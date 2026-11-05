@@ -148,7 +148,7 @@ Pika, Vidu, Wanx, SDXL, Imagen, Ideogram, Kolors, `*-image`, `*-video`) while st
 The summary supports rechecking all selected models; failed, cancelled or unstarted rechecks cannot inherit
 previous successes. Check results, source labels and latency remain in memory and are not saved. `/provider test`
 checks one model and reports its latency; it does not claim the entire provider is verified.
-Draft cancellation does not write; saved changes load after restarting OMP.
+Draft cancellation does not write. In-session interactive and non-UI `/provider` add, edit, and deletion synchronize immediately into the active OMP session's model catalog (`/models`). If the current session model belongs to a provider whose configuration is deleted or edited without that model ID, an alternative model must be selected before writing; if no replacement model is available, or if the current model is actively generating, the operation is blocked with zero configuration writes. If model catalog synchronization fails, configuration writes remain preserved on disk and a warning notification is displayed. Standalone `omp-sync` and other external OMP processes operate strictly at the file level and load changes upon their next startup.
 PRIVATE is the default and is excluded by encrypted-sync filtering; PUBLIC includes credentials
 in encrypted synchronization. Private providers remain mirrored in both existing stores.
 Background maintenance preserves the active `models.local.json` store; only obsolete root-level

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "workload": "sync-roundtrip-v1",
+  "recordedAt": "2026-11-05T03:27:24.678Z",
+  "gitHead": "daf8d737482b",
+  "metrics": {
+    "quality": {
+      "assertions": 1
+    },
+    "efficiency": {
+      "totalMs": 192,
+      "archiveMs": 49,
+      "restoreMs": 95,
+      "planMs": 48
+    },
+    "cost": {
+      "childProcessCalls": 0
+    }
+  }
+}

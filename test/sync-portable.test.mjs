@@ -54,6 +54,25 @@ import { withSyncLock } from "../src/sync-files.js";
 import { pruneBackups } from "../src/sync-transaction.js";
 import { installCron, validateCronSchedule } from "../src/maintenance.js";
 import { resolveNpmCommand } from "../src/rehydrator.js";
+import {
+  handleProviderCommand,
+  registerRuntimeProvider,
+  syncRemovedProvider,
+  ensureCurrentModel,
+  currentModel,
+  availableModels,
+  runtimeConfig,
+  saveSummary,
+  deleteProvider,
+} from "../src/provider-menu.js";
+import {
+  saveProvider,
+  getProvider,
+  removeProvider,
+  readPublicProviders,
+  readPrivateProviders,
+} from "../src/provider-store.js";
+import { setRole } from "../src/role-manager.js";
 
 const TEST_PASS = "TestPassword_12345!";
 const MAGIC = Buffer.from("OMPCFG1\0", "latin1");
@@ -3477,4 +3496,404 @@ test("62. restoreArchive repairs a range-declared plugin whose node_modules vani
     JSON.parse(fs.readFileSync(path.join(env.b.plugins, "node_modules", "demo", "package.json"), "utf8")).version,
     "1.2.3",
   );
+});
+
+test("63. provider runtime catalog synchronization", async (t) => {
+  const env = makeTempEnv("omp-provider-sync-");
+  t.after(env.cleanup);
+  const root = env.a.agent;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    return new Response(JSON.stringify({
+      data: [{ id: "mock-model" }],
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function createMockHost(agentDir) {
+    let currentSessionModel = null;
+    const dynamicProviders = new Map();
+    const registeredCommands = new Map();
+
+    const mockPi = {
+      dynamicProviders,
+      registerCommand(name, def) {
+        registeredCommands.set(name, def);
+      },
+      registerProvider(name, cfg) {
+        dynamicProviders.set(name, cfg);
+      },
+      async unregisterProvider(name) {
+        dynamicProviders.delete(name);
+      },
+      async setModel(model) {
+        currentSessionModel = model;
+      },
+    };
+
+    const notifications = [];
+    let isIdleVal = true;
+    let selectHandler = async (_title, options) => (options[0]?.label || options[0]);
+    let confirmHandler = async () => true;
+
+    const mockCtx = {
+      agentDir,
+      hasUI: false,
+      notifications,
+      ui: {
+        notify(msg, type = "info") {
+          notifications.push({ msg, type });
+        },
+        async confirm(title, body) {
+          return confirmHandler(title, body);
+        },
+        async select(title, options, opts) {
+          return selectHandler(title, options, opts);
+        },
+        async input() {
+          return "";
+        },
+      },
+      models: {
+        current() {
+          return currentSessionModel;
+        },
+      },
+      modelRegistry: {
+        async refresh() {},
+        getAvailable() {
+          const list = [];
+          const pub = readPublicProviders(agentDir);
+          for (const [pName, pCfg] of Object.entries(pub)) {
+            if (!dynamicProviders.has(pName)) {
+              for (const m of pCfg.models || []) {
+                list.push({ provider: pName, id: m.id, ...m });
+              }
+            }
+          }
+          for (const [pName, pCfg] of dynamicProviders.entries()) {
+            for (const m of pCfg.models || []) {
+              list.push({ provider: pName, id: m.id, ...m });
+            }
+          }
+          return list;
+        },
+        getAll() {
+          return this.getAvailable();
+        },
+      },
+      isIdle() {
+        return isIdleVal;
+      },
+      async waitForIdle() {},
+    };
+
+    pluginEntry(mockPi);
+
+    return {
+      mockPi,
+      mockCtx,
+      notifications,
+      setCurrentModel(model) {
+        currentSessionModel = model;
+      },
+      getCurrentModel() {
+        return currentSessionModel;
+      },
+      setSelectHandler(fn) {
+        selectHandler = fn;
+      },
+      setConfirmHandler(fn) {
+        confirmHandler = fn;
+      },
+      setIdle(val) {
+        isIdleVal = val;
+      },
+      clearNotifications() {
+        notifications.length = 0;
+      },
+    };
+  }
+
+  const host = createMockHost(root);
+  const { mockPi, mockCtx } = host;
+
+  // 1. Headless public provider add: appears in catalog, no dynamic overlay
+  await t.test("public provider add syncs into registry without dynamic overlay", async () => {
+    host.clearNotifications();
+    mockCtx.hasUI = false;
+    await handleProviderCommand(mockPi, mockCtx, "add pub1 https://api.openai.com/v1 sk-pub --api openai-completions --model gpt-4o --public", root);
+
+    const pub = readPublicProviders(root);
+    assert.ok(pub.pub1);
+    assert.equal(mockPi.dynamicProviders.has("pub1"), false);
+    assert.ok(mockCtx.modelRegistry.getAvailable().some((m) => m.provider === "pub1" && m.id === "gpt-4o"));
+    assert.ok(host.notifications.some((n) => n.msg.includes("已保存（未验证），模型目录已同步")));
+  });
+
+  // 2. Headless private provider add & edit model replacement
+  await t.test("private provider add syncs into dynamic overlay with optimized specs, edit replaces model catalog", async () => {
+    host.clearNotifications();
+    mockCtx.hasUI = false;
+    await handleProviderCommand(mockPi, mockCtx, "add priv1 https://api.deepseek.com/v1 sk-priv --api openai-completions --model deepseek-chat --private", root);
+
+    const priv = readPrivateProviders(root);
+    assert.ok(priv.priv1);
+    assert.ok(mockPi.dynamicProviders.has("priv1"));
+    const dynCfg = mockPi.dynamicProviders.get("priv1");
+    const dsModel = dynCfg.models.find((m) => m.id === "deepseek-chat");
+    assert.ok(dsModel);
+    assert.equal(dsModel.contextWindow, 1048576);
+    assert.ok(mockCtx.modelRegistry.getAvailable().some((m) => m.provider === "priv1" && m.id === "deepseek-chat"));
+    assert.ok(host.notifications.some((n) => n.msg.includes("已保存（未验证），模型目录已同步")));
+
+    // Edit priv1 replacing model list
+    host.clearNotifications();
+    saveProvider({
+      name: "priv1",
+      providerConfig: {
+        baseUrl: "https://api.deepseek.com/v1",
+        api: "openai-completions",
+        apiKey: "sk-priv",
+        models: [{ id: "deepseek-coder" }],
+      },
+      isPrivate: true,
+      agentDir: root,
+    });
+    await registerRuntimeProvider(mockPi, mockCtx, getProvider("priv1", { agentDir: root }));
+    assert.equal(mockPi.dynamicProviders.get("priv1").models[0].id, "deepseek-coder");
+    const avail = mockCtx.modelRegistry.getAvailable();
+    assert.ok(avail.some((m) => m.provider === "priv1" && m.id === "deepseek-coder"));
+    assert.equal(avail.some((m) => m.provider === "priv1" && m.id === "deepseek-chat"), false);
+  });
+
+  // 3. Headless /provider rm syncs deletion for both public and private providers
+  await t.test("headless /provider rm syncs deletion for both public and private providers", async () => {
+    host.clearNotifications();
+    mockCtx.hasUI = false;
+    await handleProviderCommand(mockPi, mockCtx, "rm pub1", root);
+    assert.equal(Boolean(readPublicProviders(root).pub1), false);
+    assert.equal(mockCtx.modelRegistry.getAvailable().some((m) => m.provider === "pub1"), false);
+    assert.ok(host.notifications.some((n) => n.msg.includes("Removed provider 'pub1' and synchronized the model catalog")));
+
+    host.clearNotifications();
+    await handleProviderCommand(mockPi, mockCtx, "rm priv1", root);
+    assert.equal(Boolean(readPrivateProviders(root).priv1), false);
+    assert.equal(mockPi.dynamicProviders.has("priv1"), false);
+    assert.equal(mockCtx.modelRegistry.getAvailable().some((m) => m.provider === "priv1"), false);
+    assert.ok(host.notifications.some((n) => n.msg.includes("Removed provider 'priv1' and synchronized the model catalog")));
+  });
+
+  // 4. Current model deletion and removal on edit
+  await t.test("current model deletion and removal on edit require replacement, canceling or no replacement preserves disk", async () => {
+    saveProvider({
+      name: "del-target",
+      providerConfig: { baseUrl: "https://t.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "m1" }] },
+      isPrivate: true,
+      agentDir: root,
+    });
+    await registerRuntimeProvider(mockPi, mockCtx, getProvider("del-target", { agentDir: root }));
+
+    saveProvider({
+      name: "alt-prov",
+      providerConfig: { baseUrl: "https://alt.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "alt-m" }] },
+      isPrivate: false,
+      agentDir: root,
+    });
+    await registerRuntimeProvider(mockPi, mockCtx, getProvider("alt-prov", { agentDir: root }));
+
+    host.setCurrentModel({ provider: "del-target", id: "m1" });
+    mockCtx.hasUI = true;
+
+    // 4a. User cancels replacement selection -> zero disk modification
+    host.clearNotifications();
+    host.setSelectHandler(async (title, options) => {
+      if (title.includes("当前模型将被移除")) return undefined;
+      return options[0];
+    });
+    await deleteProvider(mockPi, mockCtx, "del-target", root);
+    assert.ok(getProvider("del-target", { agentDir: root }));
+    assert.equal(host.getCurrentModel().provider, "del-target");
+
+    // 4b. User selects replacement -> model switched, deleted, catalog synchronized
+    host.clearNotifications();
+    host.setSelectHandler(async (title, options) => {
+      if (title.includes("当前模型将被移除")) return "alt-prov/alt-m";
+      return options[0];
+    });
+    await deleteProvider(mockPi, mockCtx, "del-target", root);
+    assert.equal(getProvider("del-target", { agentDir: root }), null);
+    assert.equal(host.getCurrentModel().provider, "alt-prov");
+    assert.equal(host.getCurrentModel().id, "alt-m");
+    assert.ok(host.notifications.some((n) => n.msg.includes("当前模型已切换到 alt-prov/alt-m")));
+    assert.ok(host.notifications.some((n) => n.msg.includes("已删除 del-target，模型目录已同步")));
+
+    // 4c. No replacement candidate -> block with zero writes
+    removeProvider({ name: "alt-prov", agentDir: root });
+    await syncRemovedProvider(mockPi, mockCtx, "alt-prov", false);
+
+    saveProvider({
+      name: "only-one",
+      providerConfig: { baseUrl: "https://one.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "o1" }] },
+      isPrivate: false,
+      agentDir: root,
+    });
+    await registerRuntimeProvider(mockPi, mockCtx, getProvider("only-one", { agentDir: root }));
+    host.setCurrentModel({ provider: "only-one", id: "o1" });
+
+    host.clearNotifications();
+    await deleteProvider(mockPi, mockCtx, "only-one", root);
+    assert.ok(getProvider("only-one", { agentDir: root }));
+    assert.ok(host.notifications.some((n) => n.msg.includes("没有可切换的其它模型，未删除")));
+  });
+
+  // 5. Headless /provider rm rejects delete when current model is active
+  await t.test("headless /provider rm rejects delete when current model is active, keeping disk untouched", async () => {
+    saveProvider({
+      name: "active-hl",
+      providerConfig: { baseUrl: "https://hl.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "h1" }] },
+      isPrivate: false,
+      agentDir: root,
+    });
+    await registerRuntimeProvider(mockPi, mockCtx, getProvider("active-hl", { agentDir: root }));
+    host.setCurrentModel({ provider: "active-hl", id: "h1" });
+    mockCtx.hasUI = false;
+
+    host.clearNotifications();
+    await handleProviderCommand(mockPi, mockCtx, "rm active-hl", root);
+    assert.ok(getProvider("active-hl", { agentDir: root }));
+    assert.equal(host.getCurrentModel().provider, "active-hl");
+    assert.ok(host.notifications.some((n) => n.msg.includes("当前模型属于 active-hl，请先使用 /model 切换后再删除")));
+  });
+
+  // 6. Retaining current model ID on edit keeps model and rebinds object
+  await t.test("retaining current model ID on edit keeps model and rebinds model object without replacement prompt", async () => {
+    saveProvider({
+      name: "keep-prov",
+      providerConfig: { baseUrl: "https://k1.example.com", api: "openai-completions", apiKey: "k1", models: [{ id: "km" }] },
+      isPrivate: false,
+      agentDir: root,
+    });
+    await registerRuntimeProvider(mockPi, mockCtx, getProvider("keep-prov", { agentDir: root }));
+    host.setCurrentModel({ provider: "keep-prov", id: "km", oldProp: true });
+    mockCtx.hasUI = true;
+
+    host.clearNotifications();
+    host.setSelectHandler(async (title, options) => {
+      if (title.includes("当前模型将被移除")) throw new Error("Should not prompt to replace model!");
+      if (title.startsWith("SAVE //")) return "保存配置";
+      return options[0];
+    });
+
+    const draft = {
+      name: "keep-prov",
+      isPrivate: false,
+      requireVerifiedModels: false,
+      config: {
+        api: "openai-completions",
+        baseUrl: "https://k2.example.com",
+        apiKey: "k2",
+        models: [{ id: "km" }],
+      },
+      checks: new Map([["km", { ok: true }]]),
+    };
+
+    const saved = await saveSummary(mockPi, mockCtx, draft, root, false);
+    assert.equal(saved, true);
+    assert.equal(host.getCurrentModel().provider, "keep-prov");
+    assert.equal(host.getCurrentModel().id, "km");
+    assert.ok(host.notifications.some((n) => n.msg.includes("已保存，模型目录已同步")));
+  });
+
+  // 7. Idle block, role binding block, cancel confirm, and sync failure error reporting
+  await t.test("idle block, role binding block, cancel confirm, and sync failure error reporting", async () => {
+    // 7a. Idle block
+    saveProvider({
+      name: "busy-prov",
+      providerConfig: { baseUrl: "https://b.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "b1" }] },
+      isPrivate: false,
+      agentDir: root,
+    });
+    await registerRuntimeProvider(mockPi, mockCtx, getProvider("busy-prov", { agentDir: root }));
+    host.setCurrentModel({ provider: "busy-prov", id: "b1" });
+    host.setIdle(false);
+
+    host.clearNotifications();
+    await deleteProvider(mockPi, mockCtx, "busy-prov", root);
+    assert.ok(getProvider("busy-prov", { agentDir: root }));
+    assert.ok(host.notifications.some((n) => n.msg.includes("当前模型正在响应，完成后再删除")));
+    host.setIdle(true);
+
+    // 7b. Role binding block
+    saveProvider({
+      name: "role-prov",
+      providerConfig: { baseUrl: "https://r.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "r1" }] },
+      isPrivate: false,
+      agentDir: root,
+    });
+    setRole("smol", "role-prov/r1", { agentDir: root, validate: false });
+    host.setCurrentModel(null);
+    mockCtx.hasUI = false;
+
+    host.clearNotifications();
+    await handleProviderCommand(mockPi, mockCtx, "rm role-prov", root);
+    assert.ok(getProvider("role-prov", { agentDir: root }));
+    assert.ok(host.notifications.some((n) => n.msg.includes("绑定角色: smol；请先通过 /role 改绑")));
+
+    // 7c. Cancel confirm
+    saveProvider({
+      name: "cancel-prov",
+      providerConfig: { baseUrl: "https://c.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "c1" }] },
+      isPrivate: false,
+      agentDir: root,
+    });
+    mockCtx.hasUI = true;
+    host.setConfirmHandler(async () => false);
+
+    host.clearNotifications();
+    await deleteProvider(mockPi, mockCtx, "cancel-prov", root);
+    assert.ok(getProvider("cancel-prov", { agentDir: root }));
+    host.setConfirmHandler(async () => true);
+
+    // 7d. Sync failure on delete: disk write preserved, sync failure reported
+    saveProvider({
+      name: "fail-prov",
+      providerConfig: { baseUrl: "https://f.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "f1" }] },
+      isPrivate: true,
+      agentDir: root,
+    });
+    mockPi.unregisterProvider = async () => {
+      throw new Error("mock-unregister-fault");
+    };
+
+    host.clearNotifications();
+    await deleteProvider(mockPi, mockCtx, "fail-prov", root);
+    assert.equal(getProvider("fail-prov", { agentDir: root }), null);
+    assert.ok(host.notifications.some((n) => n.msg.includes("配置已删除，但模型目录同步失败: mock-unregister-fault")));
+  });
+
+  // 8. Standalone CLI omp-sync provider rm functions without host objects
+  await t.test("standalone CLI omp-sync provider rm functions without host objects", () => {
+    saveProvider({
+      name: "cli-target",
+      providerConfig: { baseUrl: "https://cli.example.com", api: "openai-completions", apiKey: "k", models: [{ id: "cm" }] },
+      isPrivate: false,
+      agentDir: root,
+    });
+    assert.ok(getProvider("cli-target", { agentDir: root }));
+
+    const res = spawnSync(
+      process.execPath,
+      [path.resolve("./bin/omp-sync.js"), "provider", "rm", "cli-target", "--force"],
+      { env: { ...process.env, OMP_CFG_ROOT: root }, encoding: "utf8" }
+    );
+    assert.equal(res.status, 0);
+    assert.equal(getProvider("cli-target", { agentDir: root }), null);
+  });
 });

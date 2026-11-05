@@ -1,6 +1,6 @@
 {
   "name": "omp-config-crypt",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "description": "Universal cross-platform encrypted portability for omp config, extensions, and instructions",
   "type": "module",
   "license": "MIT",
@@ -11,7 +11,9 @@
     "omp-sync": "./bin/omp-sync.js"
   },
   "scripts": {
-    "test": "node test/sync-portable.test.mjs"
+    "test": "node test/sync-portable.test.mjs",
+    "eval": "node eval/change-eval.mjs",
+    "eval:gate": "omp-agent-eval"
   },
   "keywords": [
     "omp",
