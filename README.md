@@ -1,4 +1,4 @@
-# omp-config-crypt (v0.7.0)
+# omp-config-crypt (v0.9.6)
 
 Universal, zero-repair cross-platform configuration encryption and synchronization engine for `omp` (Oh My Pi).
 
@@ -62,6 +62,9 @@ npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN"
 #   --strategy prefer-local   keep local files and adopt them as the new baseline
 npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN" --strategy prefer-remote
 
+# Keep every modelRoles leaf local (preset and top-level). Other conflicts still abort.
+npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN" --local
+
 # Rollback to previous configuration snapshot
 npx omp-config-crypt rollback
 
@@ -95,8 +98,8 @@ Configuration exports include the installed `omp-config-crypt` source (excluding
 /config-push gist:new
 /config-push gist:<id>
 /config-push https://…
-/config-pull gist:<id> [--dry-run] [--force]
-/config-pull https://… [--dry-run] [--force]
+/config-pull gist:<id> [--dry-run] [--force] [--local]
+/config-pull https://… [--dry-run] [--force] [--local]
 /config-rollback
 /config-upgrade [--check]
 /config-doctor [gist:<id> | https://…]

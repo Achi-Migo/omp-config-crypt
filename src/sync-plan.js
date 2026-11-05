@@ -764,11 +764,19 @@ export function adaptLegacySnapshot(snapshot) {
  */
 export const SYNC_STRATEGIES = new Set(["manual", "prefer-remote", "prefer-local"]);
 
+function isModelRoleSetting(id) {
+  if (!id.startsWith("setting:")) return false;
+  const tokens = id.slice("setting:".length).split("/").filter(Boolean);
+  const at = tokens.lastIndexOf("modelRoles");
+  return at >= 0 && at === tokens.length - 2;
+}
+
 export function planSync(snapshot, root = configRoot(), options = {}) {
   const strategy = options.strategy == null || options.strategy === undefined ? "manual" : options.strategy;
   if (!SYNC_STRATEGIES.has(strategy)) {
     throw new Error(`Invalid sync strategy '${strategy}'; expected one of: ${Array.from(SYNC_STRATEGIES).join(", ")}`);
   }
+  const keepLocalRoles = options.keepLocalRoles === true;
   const validSnapshot = validateSnapshot(snapshot);
   const policy = readSyncPolicy(root);
   const state = readSyncState(root);
@@ -1011,6 +1019,15 @@ export function planSync(snapshot, root = configRoot(), options = {}) {
           ? { hash: localHash, tombstone: false }
           : { hash: SENTINEL_DELETED, tombstone: true });
       }
+    }
+
+    // --local: modelRoles leaves stay local. Other conflicts still abort the plan.
+    if (plannedAction === "conflict" && keepLocalRoles && isModelRoleSetting(id)) {
+      plannedAction = localPresent ? "keep" : "delete";
+      reason = "conflict-resolved-local-role";
+      acceptedTransitions.set(id, localPresent
+        ? { hash: localHash, tombstone: false }
+        : { hash: SENTINEL_DELETED, tombstone: true });
     }
 
     // Check for plugin prerequisite if plannedAction is add or update

@@ -2102,26 +2102,30 @@ test("32. Crash mid-commit leaves a recoverable lock and never accepts a residua
 });
 
 test("33. extractDryRun recognizes independent dry-run tokens and preserves path spaces", (t) => {
-  assert.deepEqual(extractDryRun("archive.enc --dry-run"), { dryRun: true, force: false, strategy: null, clean: "archive.enc" });
-  assert.deepEqual(extractDryRun("--dry-run archive.enc"), { dryRun: true, force: false, strategy: null, clean: "archive.enc" });
-  assert.deepEqual(extractDryRun("archive.enc -d"), { dryRun: true, force: false, strategy: null, clean: "archive.enc" });
-  assert.deepEqual(extractDryRun("-d archive.enc"), { dryRun: true, force: false, strategy: null, clean: "archive.enc" });
-  assert.deepEqual(extractDryRun("\"my archive.enc\" --dry-run"), { dryRun: true, force: false, strategy: null, clean: "my archive.enc" });
-  assert.deepEqual(extractDryRun("'spaced file.enc' -d"), { dryRun: true, force: false, strategy: null, clean: "spaced file.enc" });
+  assert.deepEqual(extractDryRun("archive.enc --dry-run"), { dryRun: true, force: false, strategy: null, keepLocal: false, clean: "archive.enc" });
+  assert.deepEqual(extractDryRun("--dry-run archive.enc"), { dryRun: true, force: false, strategy: null, keepLocal: false, clean: "archive.enc" });
+  assert.deepEqual(extractDryRun("archive.enc -d"), { dryRun: true, force: false, strategy: null, keepLocal: false, clean: "archive.enc" });
+  assert.deepEqual(extractDryRun("-d archive.enc"), { dryRun: true, force: false, strategy: null, keepLocal: false, clean: "archive.enc" });
+  assert.deepEqual(extractDryRun("\"my archive.enc\" --dry-run"), { dryRun: true, force: false, strategy: null, keepLocal: false, clean: "my archive.enc" });
+  assert.deepEqual(extractDryRun("'spaced file.enc' -d"), { dryRun: true, force: false, strategy: null, keepLocal: false, clean: "spaced file.enc" });
   assert.deepEqual(
     extractDryRun("https://example.invalid/path?x=--dry-run"),
-    { dryRun: false, force: false, strategy: null, clean: "https://example.invalid/path?x=--dry-run" }
+    { dryRun: false, force: false, strategy: null, keepLocal: false, clean: "https://example.invalid/path?x=--dry-run" }
   );
-  assert.deepEqual(extractDryRun("plain.enc"), { dryRun: false, force: false, strategy: null, clean: "plain.enc" });
+  assert.deepEqual(extractDryRun("plain.enc"), { dryRun: false, force: false, strategy: null, keepLocal: false, clean: "plain.enc" });
 
   // Strategy flags are parsed out, never leaked into the positional spec
   assert.deepEqual(
     extractDryRun("gist:8b9dbf62 --strategy prefer-remote -f"),
-    { dryRun: false, force: true, strategy: "prefer-remote", clean: "gist:8b9dbf62" }
+    { dryRun: false, force: true, strategy: "prefer-remote", keepLocal: false, clean: "gist:8b9dbf62" }
   );
   assert.deepEqual(
     extractDryRun("--strategy=prefer-local gist:abc -d"),
-    { dryRun: true, force: false, strategy: "prefer-local", clean: "gist:abc" }
+    { dryRun: true, force: false, strategy: "prefer-local", keepLocal: false, clean: "gist:abc" }
+  );
+  assert.deepEqual(
+    extractDryRun("gist:8b9dbf62 --local"),
+    { dryRun: false, force: false, strategy: null, keepLocal: true, clean: "gist:8b9dbf62" }
   );
   assert.throws(() => extractDryRun("--strategy"), /--strategy requires a value/);
   assert.throws(() => extractDryRun("--strategy --force gist:abc"), /--strategy requires a value/);
@@ -3078,8 +3082,8 @@ test("52. resolveNpmCommand maps win32 to npm.cmd with shell", () => {
 });
 
 test("53. pull --force adopts remote namespace with .bak backups; extractDryRun strips --force", async (t) => {
-  assert.deepEqual(extractDryRun("gist:abc --force"), { dryRun: false, force: true, strategy: null, clean: "gist:abc" });
-  assert.deepEqual(extractDryRun("gist:abc"), { dryRun: false, force: false, strategy: null, clean: "gist:abc" });
+  assert.deepEqual(extractDryRun("gist:abc --force"), { dryRun: false, force: true, strategy: null, keepLocal: false, clean: "gist:abc" });
+  assert.deepEqual(extractDryRun("gist:abc"), { dryRun: false, force: false, strategy: null, keepLocal: false, clean: "gist:abc" });
 
   const env = makeTempEnv("omp-ns-force-");
   t.after(env.cleanup);
@@ -3288,6 +3292,74 @@ test("N. Strategy resolution for initial both-exist-different conflicts", async 
   applySyncPlan(planL2, rootC);
   const mcpC = JSON.parse(fs.readFileSync(path.join(rootC, "mcp.json"), "utf8"));
   assert.equal(mcpC.mcpServers.srv.args[0], "c.js");
+});
+
+test("N2. --local keeps modelRoles leaves and still aborts other conflicts", async (t) => {
+  const env = makeTempEnv();
+  t.after(env.cleanup);
+  const rootA = env.a.agent;
+  const rootB = env.b.agent;
+  fs.writeFileSync(
+    path.join(rootA, "config.yml"),
+    "theme: remote\nmodelRoles:\n  advisor: remote/model\nmodelPresets:\n  default:\n    modelRoles:\n      advisor: remote/preset\n",
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(rootA, "mcp.json"),
+    JSON.stringify({ mcpServers: { srv: { command: "node", args: ["a.js"] } } }),
+    "utf8"
+  );
+  for (const id of [
+    "setting:/theme",
+    "setting:/modelRoles/advisor",
+    "setting:/modelPresets/default/modelRoles/advisor",
+    "mcp:srv",
+  ]) {
+    await setResourceScope(rootA, id, "public");
+  }
+  const { blob } = buildArchive(TEST_PASS, rootA);
+  const payload = decryptTestArchive(blob);
+
+  fs.writeFileSync(
+    path.join(rootB, "config.yml"),
+    "theme: local\nmodelRoles:\n  advisor: local/model\nmodelPresets:\n  default:\n    modelRoles:\n      advisor: local/preset\n",
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(rootB, "mcp.json"),
+    JSON.stringify({ mcpServers: { srv: { command: "node", args: ["b.js"] } } }),
+    "utf8"
+  );
+
+  const blocked = planSync(payload, rootB, { keepLocalRoles: true });
+  assert.deepEqual(blocked.conflicts.map((c) => c.id).sort(), ["mcp:srv", "setting:/theme"]);
+  const kept = blocked.actions.filter((a) => a.reason === "conflict-resolved-local-role").map((a) => a.id).sort();
+  assert.deepEqual(kept, [
+    "setting:/modelPresets/default/modelRoles/advisor",
+    "setting:/modelRoles/advisor",
+  ]);
+  assert.throws(() => applySyncPlan(blocked, rootB), /conflict/);
+
+  fs.writeFileSync(
+    path.join(rootB, "mcp.json"),
+    JSON.stringify({ mcpServers: { srv: { command: "node", args: ["a.js"] } } }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(rootB, "config.yml"),
+    "theme: remote\nmodelRoles:\n  advisor: local/model\nmodelPresets:\n  default:\n    modelRoles:\n      advisor: local/preset\n",
+    "utf8"
+  );
+  const plan = planSync(payload, rootB, { keepLocalRoles: true });
+  assert.equal(plan.conflicts.length, 0);
+  applySyncPlan(plan, rootB);
+  const yml = fs.readFileSync(path.join(rootB, "config.yml"), "utf8");
+  assert.match(yml, /advisor: local\/model/);
+  assert.match(yml, /advisor: local\/preset/);
+  assert.match(yml, /^theme: remote$/m);
+  const state = readSyncState(rootB);
+  const localRole = readResource(rootB, "setting:/modelRoles/advisor");
+  assert.equal(state.resources["setting:/modelRoles/advisor"].hash, canonicalHash(localRole.value));
 });
 
 test("58. probeGistAccess classifies 200/401/404/network failure without parsing the body", async () => {

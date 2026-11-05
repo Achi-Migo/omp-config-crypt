@@ -462,14 +462,14 @@ export function restoreArchive(blob, pass, root = configRoot(), options = {}) {
     repairUnreadablePlugins(effectivePayload, root, { install: options.installFn });
   }
 
-  let plan = planSync(effectivePayload, root, { strategy: options.strategy });
+  let plan = planSync(effectivePayload, root, { strategy: options.strategy, keepLocalRoles: options.keepLocalRoles === true });
 
   // Self-healing stage 2: install plugin dependencies the plan blocked on, then replan
   // once (the install mutates the plugins tree, so the original plan is stale). Remaining
   // blocked actions still fail the apply.
   if (!dryRun && plan.prerequisites.length > 0 && options.autoFixPlugins !== false) {
     const fx = fixPluginPrerequisites(plan, root, { install: options.installFn, payload: effectivePayload });
-    if (fx.fixed.length > 0) plan = planSync(effectivePayload, root, { strategy: options.strategy });
+    if (fx.fixed.length > 0) plan = planSync(effectivePayload, root, { strategy: options.strategy, keepLocalRoles: options.keepLocalRoles === true });
   }
 
   if (dryRun) {
@@ -890,12 +890,13 @@ export function parseSpec(spec) {
 
 export function extractDryRun(str) {
   const raw = String(str || "").trim();
-  if (!raw) return { dryRun: false, force: false, strategy: null, clean: "" };
+  if (!raw) return { dryRun: false, force: false, strategy: null, keepLocal: false, clean: "" };
   const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^"\\]*)*)'|(\S+)/g;
   let match;
   let dryRun = false;
   let force = false;
   let strategy = null;
+  let keepLocal = false;
   const kept = [];
   const tokens = [];
   while ((match = re.exec(raw))) {
@@ -910,6 +911,10 @@ export function extractDryRun(str) {
     }
     if (token === "--force" || token === "-f") {
       force = true;
+      continue;
+    }
+    if (token === "--local") {
+      keepLocal = true;
       continue;
     }
     if (token === "--strategy") {
@@ -929,7 +934,7 @@ export function extractDryRun(str) {
     }
     kept.push(token);
   }
-  return { dryRun, force, strategy, clean: kept.join(" ") };
+  return { dryRun, force, strategy, keepLocal, clean: kept.join(" ") };
 }
 
 export function formatSyncReport(result = {}) {
@@ -1167,14 +1172,14 @@ export default function (pi) {
   pi.registerCommand("config-import", {
     description: "Decrypt and restore an omp config archive (--dry-run to preview)",
     handler: async (args, ctx) => {
-      const { dryRun, strategy, clean: src } = extractDryRun(args || "");
+      const { dryRun, strategy, keepLocal, clean: src } = extractDryRun(args || "");
       if (!src) {
         ctx.ui.notify("usage: /config-import <file.enc> [--dry-run] [--strategy prefer-remote|prefer-local]", "error");
         return;
       }
       try {
         const pass = await askPass(ctx, "Import passphrase");
-        const r = importEncrypted(src, pass, configRoot(), { dryRun, strategy });
+        const r = importEncrypted(src, pass, configRoot(), { dryRun, strategy, keepLocalRoles: keepLocal });
         if (r.adaptedFile) {
           ctx.ui.notify(`[import] incompatible v${r.legacy?.from}; adapted -> ${r.adaptedFile}`, "info");
         }
@@ -1226,9 +1231,9 @@ export default function (pi) {
         const sel = await selectPublicResources(ctx, root);
         if (sel === null) return;
       }
-      const { dryRun, force, strategy, clean: spec } = extractDryRun(args || "");
+      const { dryRun, force, strategy, keepLocal, clean: spec } = extractDryRun(args || "");
       if (!spec) {
-        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run] [--force] [--strategy prefer-remote|prefer-local]", "error");
+        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run] [--force] [--strategy prefer-remote|prefer-local] [--local]", "error");
         return;
       }
       try {
@@ -1236,8 +1241,8 @@ export default function (pi) {
         const pass = await askPass(ctx, "Pull passphrase");
         const token = await askToken(ctx, "Cloud token", target.kind === "gist");
         const r = target.kind === "gist"
-          ? await pullGist(target.id, pass, configRoot(), token, { dryRun, force, strategy })
-          : await pullHttp(target.url, pass, configRoot(), token, { dryRun, force, strategy });
+          ? await pullGist(target.id, pass, configRoot(), token, { dryRun, force, strategy, keepLocalRoles: keepLocal })
+          : await pullHttp(target.url, pass, configRoot(), token, { dryRun, force, strategy, keepLocalRoles: keepLocal });
         if (Array.isArray(r.preflight) && r.preflight.length > 0) {
           ctx.ui.notify(
             "[pull] preflight:\n" + r.preflight.map((c) => `  [${c.status.toUpperCase()}] ${c.id}: ${c.detail}`).join("\n"),

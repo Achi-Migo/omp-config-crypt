@@ -62,6 +62,8 @@ Commands:
                            (--strategy prefer-remote|prefer-local auto-resolves
                            conflicts by taking remote or local side; default:
                            report conflicts and abort)
+                           (--local keeps modelRoles leaves local and still
+                           aborts on every other conflict)
   rollback                 Revert the most recent config restore from its backup
   doctor [target]          Preflight env/config checks with self-healing
                            (optional gist:<id> or https://url target)
@@ -91,6 +93,7 @@ Options:
   -y, --yes                Non-interactive mode (use defaults without prompting)
   -f, --force              Force operations (pull: adopt differing remote namespace)
       --strategy <mode>    Conflict resolution for pull: prefer-remote | prefer-local
+      --local              Keep modelRoles leaves local; other conflicts still abort
       --profile <name>       Target specific profile scene (e.g. dev, ops)
 
 Environment Variables:
@@ -122,6 +125,7 @@ function parseCliArgs(argv) {
     nonInteractive: false,
     force: false,
     strategy: null,
+    keepLocal: false,
     checkOnly: false,
     positional: [],
     profile: null,
@@ -164,6 +168,8 @@ function parseCliArgs(argv) {
       options.strategy = args[++i];
     } else if (a.startsWith("--strategy=")) {
       options.strategy = a.slice(11);
+    } else if (a === "--local") {
+      options.keepLocal = true;
     } else if (a === "--check") {
       options.checkOnly = true;
     } else if (a === "--profile") {
@@ -323,6 +329,7 @@ async function main() {
         const res = importEncrypted(options.target, pass, root, {
           dryRun: options.dryRun,
           strategy: options.strategy,
+          keepLocalRoles: options.keepLocal,
         });
         if (res.adaptedFile) {
           console.log(`[import] incompatible v${res.legacy?.from}; adapted -> ${res.adaptedFile}`);
@@ -374,8 +381,8 @@ async function main() {
         const token = await resolveToken(options.token, target.kind === "gist");
         const res =
           target.kind === "gist"
-            ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy })
-            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy });
+            ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy, keepLocalRoles: options.keepLocal })
+            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy, keepLocalRoles: options.keepLocal });
         if (res.adoptedNamespace) {
           console.log(`[pull] Adopted remote namespace ${res.adoptedNamespace} (--force); prior policy/state saved as .bak`);
         }
