@@ -151,32 +151,7 @@ export default async function (pi) {
   }
 
   // 异步在后台静默刷新 OpenRouter 权威模型规格并落盘缓存
-  (async () => {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 6000);
-      const res = await fetch("https://openrouter.ai/api/v1/models", { signal: controller.signal });
-      clearTimeout(timer);
-      if (!res.ok) return;
-      const json = await res.json();
-      const updatedSpecs = {};
-      for (const m of json.data || []) {
-        if (!m.id) continue;
-        const shortName = m.id.split("/").pop().toLowerCase();
-        const spec = {
-          contextWindow: m.context_length || DEFAULT_CONTEXT_WINDOW,
-          maxTokens: m.top_provider?.max_completion_tokens || DEFAULT_MAX_TOKENS,
-          hasImage: m.architecture?.modality?.includes("image") || false
-        };
-        updatedSpecs[shortName] = spec;
-        updatedSpecs[m.id.toLowerCase()] = spec;
-      }
-      if (!fs.existsSync(cacheDir)) {
-        fs.mkdirSync(cacheDir, { recursive: true });
-      }
-      fs.writeFileSync(cachePath, JSON.stringify(updatedSpecs, null, 2), "utf8");
-    } catch {}
-  })();
+  // 已移除：OpenRouter 规格改为添加 provider 时一次性查询并写死，启动不再联网刷新。
 
   // 注册 /models-optimize 治理命令
   pi.registerCommand("models-optimize", {
