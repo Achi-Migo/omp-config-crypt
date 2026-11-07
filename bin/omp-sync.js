@@ -16,6 +16,7 @@ import {
   exportEncrypted,
   importEncrypted,
   pullGist,
+  pushGist,
   pushHttp,
   pullHttp,
   rollback,
