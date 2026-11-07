@@ -58,9 +58,9 @@ npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN"
 
 # Conflict resolution: when local files differ from remote with no baseline
 # (initial-conflict-both-exist-different), default behavior aborts. Auto-resolve:
-#   --strategy prefer-remote  overwrite local with remote (typical fresh-machine pull)
-#   --strategy prefer-local   keep local files and adopt them as the new baseline
-npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN" --strategy prefer-remote
+#   --mode remote   overwrite local with remote (typical fresh-machine pull)
+#   --mode local    keep local files and adopt them as the new baseline
+npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN" --mode remote
 
 # Keep every modelRoles leaf local (preset and top-level). Other conflicts still abort.
 npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN" --local
@@ -98,8 +98,8 @@ Configuration exports include the installed `omp-config-crypt` source (excluding
 /config-push gist:new
 /config-push gist:<id>
 /config-push https://…
-/config-pull gist:<id> [--dry-run] [--force] [--local]
-/config-pull https://… [--dry-run] [--force] [--local]
+/config-pull gist:<id> [--dry-run] [--force] [--mode remote|local] [--local]
+/config-pull https://… [--dry-run] [--force] [--mode remote|local] [--local]
 /config-rollback
 /config-upgrade [--check]
 /config-doctor [gist:<id> | https://…]

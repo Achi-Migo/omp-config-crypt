@@ -2114,31 +2114,36 @@ test("33. extractDryRun recognizes independent dry-run tokens and preserves path
   );
   assert.deepEqual(extractDryRun("plain.enc"), { dryRun: false, force: false, strategy: null, keepLocal: false, clean: "plain.enc" });
 
-  // Strategy flags are parsed out, never leaked into the positional spec
+  // Mode flags are parsed out, never leaked into the positional spec
   assert.deepEqual(
-    extractDryRun("gist:8b9dbf62 --strategy prefer-remote -f"),
+    extractDryRun("gist:8b9dbf62 --mode remote -f"),
     { dryRun: false, force: true, strategy: "prefer-remote", keepLocal: false, clean: "gist:8b9dbf62" }
   );
   assert.deepEqual(
-    extractDryRun("--strategy=prefer-local gist:abc -d"),
+    extractDryRun("--mode=local gist:abc -d"),
     { dryRun: true, force: false, strategy: "prefer-local", keepLocal: false, clean: "gist:abc" }
+  );
+  // Legacy --strategy values still accepted for backward compatibility
+  assert.deepEqual(
+    extractDryRun("gist:8b9dbf62 --strategy prefer-remote"),
+    { dryRun: false, force: false, strategy: "prefer-remote", keepLocal: false, clean: "gist:8b9dbf62" }
   );
   assert.deepEqual(
     extractDryRun("gist:8b9dbf62 --local"),
     { dryRun: false, force: false, strategy: null, keepLocal: true, clean: "gist:8b9dbf62" }
   );
-  assert.throws(() => extractDryRun("--strategy"), /--strategy requires a value/);
-  assert.throws(() => extractDryRun("--strategy --force gist:abc"), /--strategy requires a value/);
+  assert.throws(() => extractDryRun("--mode"), /--mode requires a value/);
+  assert.throws(() => extractDryRun("--mode --force gist:abc"), /--mode requires a value/);
   assert.throws(() => extractDryRun("gist:abc --bogus"), /unknown flag: --bogus/);
 
   // parseSpec never treats trailing flags as part of the gist id
-  assert.deepEqual(parseSpec("gist:8b9dbf629d462142c2962d874a49e9fb --strategy prefer-remote"), {
+  assert.deepEqual(parseSpec("gist:8b9dbf629d462142c2962d874a49e9fb --mode remote"), {
     kind: "gist",
     id: "8b9dbf629d462142c2962d874a49e9fb",
   });
   assert.deepEqual(parseSpec("gist:new"), { kind: "gist", id: "new" });
   assert.deepEqual(parseSpec("https://example.com/a.enc"), { kind: "http", url: "https://example.com/a.enc" });
-  assert.throws(() => parseSpec("https://example.com/a.enc --strategy prefer-remote"), /expected gist/);
+  assert.throws(() => parseSpec("https://example.com/a.enc --mode remote"), /expected gist/);
 });
 
 test("34. Sync CLI rejects obsolete rehydrate flags and keeps independent rehydrate help", (t) => {

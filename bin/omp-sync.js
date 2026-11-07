@@ -60,7 +60,7 @@ Commands:
   pull <gist:id|url>       Download and restore configs from Gist or HTTP URL
                            (-f/--force adopts a differing remote namespace; local
                            policy/state are backed up to .bak first)
-                           (--strategy prefer-remote|prefer-local auto-resolves
+                           (--mode remote|local auto-resolves
                            conflicts by taking remote or local side; default:
                            report conflicts and abort)
                            (--local keeps modelRoles leaves local and still
@@ -93,7 +93,7 @@ Options:
       --public             Save as public (synced across machines via models.yml)
   -y, --yes                Non-interactive mode (use defaults without prompting)
   -f, --force              Force operations (pull: adopt differing remote namespace)
-      --strategy <mode>    Conflict resolution for pull: prefer-remote | prefer-local
+      --mode <mode>        Conflict resolution for pull: remote | local
       --local              Keep modelRoles leaves local; other conflicts still abort
       --profile <name>       Target specific profile scene (e.g. dev, ops)
 
@@ -165,10 +165,12 @@ function parseCliArgs(argv) {
       options.nonInteractive = true;
     } else if (a === "-f" || a === "--force") {
       options.force = true;
-    } else if (a === "--strategy") {
-      options.strategy = args[++i];
-    } else if (a.startsWith("--strategy=")) {
-      options.strategy = a.slice(11);
+    } else if (a === "--mode" || a === "--strategy") {
+      const v = args[++i];
+      options.strategy = v === "remote" ? "prefer-remote" : v === "local" ? "prefer-local" : v;
+    } else if (a.startsWith("--mode=") || a.startsWith("--strategy=")) {
+      const v = a.startsWith("--mode=") ? a.slice(7) : a.slice(11);
+      options.strategy = v === "remote" ? "prefer-remote" : v === "local" ? "prefer-local" : v;
     } else if (a === "--local") {
       options.keepLocal = true;
     } else if (a === "--check") {

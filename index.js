@@ -918,12 +918,17 @@ export function extractDryRun(str) {
       keepLocal = true;
       continue;
     }
-    if (token === "--strategy") {
+    if (token === "--mode" || token === "--strategy") {
       const value = tokens[++i];
       if (value === undefined || value.startsWith("-")) {
-        throw new Error("--strategy requires a value: prefer-remote | prefer-local");
+        throw new Error((token === "--mode" ? "--mode" : "--strategy") + " requires a value: remote | local");
       }
-      strategy = value;
+      strategy = value === "remote" ? "prefer-remote" : value === "local" ? "prefer-local" : value;
+      continue;
+    }
+    if (token.startsWith("--mode=")) {
+      const value = token.slice(7);
+      strategy = value === "remote" ? "prefer-remote" : value === "local" ? "prefer-local" : value;
       continue;
     }
     if (token.startsWith("--strategy=")) {
@@ -1175,7 +1180,7 @@ export default function (pi) {
     handler: async (args, ctx) => {
       const { dryRun, strategy, keepLocal, clean: src } = extractDryRun(args || "");
       if (!src) {
-        ctx.ui.notify("usage: /config-import <file.enc> [--dry-run] [--strategy prefer-remote|prefer-local]", "error");
+        ctx.ui.notify("usage: /config-import <file.enc> [--dry-run] [--mode remote|local]", "error");
         return;
       }
       try {
@@ -1234,7 +1239,7 @@ export default function (pi) {
       }
       const { dryRun, force, strategy, keepLocal, clean: spec } = extractDryRun(args || "");
       if (!spec) {
-        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run] [--force] [--strategy prefer-remote|prefer-local] [--local]", "error");
+        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run] [--force] [--mode remote|local] [--local]", "error");
         return;
       }
       try {
