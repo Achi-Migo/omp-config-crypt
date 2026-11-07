@@ -54,6 +54,7 @@ import {
   formatYamlModels,
 } from "./src/provider-store.js";
 import { getRoles, setRole, VALID_ROLES } from "./src/role-manager.js";
+import { runPullModelHeal } from "./src/role-healer.js";
 import { handleProviderCommand, providerCompletions } from "./src/provider-menu.js";
 import {
   runMaintenance,
@@ -1262,6 +1263,24 @@ export default function (pi) {
           ctx.ui.notify(`[dry-run]\n${formatSyncReport(r)}`, "info");
         } else {
           ctx.ui.notify(`restored ${r.files} files${r.backupDir ? ` (backup: ${r.backupDir})` : ""}; restart omp`, "info");
+          try {
+            const heal = await runPullModelHeal(ctx, { root: configRoot(), notify: (msg, type) => ctx.ui.notify(msg, type) });
+            if (heal && heal.applied.length > 0) {
+              ctx.ui.notify(
+                "[pull] 模型替换:\n" + heal.applied.map((a) => `  ${a.pointer}: ${a.from} -> ${a.to}`).join("\n") +
+                  "\nrestart omp 生效",
+                "info",
+              );
+            }
+            if (heal && heal.skipped.length > 0) {
+              ctx.ui.notify(
+                "[pull] 未替换的不可用引用:\n" + heal.skipped.map((s) => `  ${s.pointer}: ${s.ref} (${s.reason})`).join("\n"),
+                "warn",
+              );
+            }
+          } catch (healError) {
+            ctx.ui.notify(`model heal skipped: ${healError?.message ?? healError}`, "warn");
+          }
         }
       } catch (error) {
         const report = error?.plan ? `\n${formatSyncReport(error.plan)}` : "";

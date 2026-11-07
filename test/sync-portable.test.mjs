@@ -3969,3 +3969,286 @@ test("63. provider runtime catalog synchronization", async (t) => {
     assert.equal(getProvider("cli-target", { agentDir: root }), null);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Pull model-availability heal (role-healer)
+// ---------------------------------------------------------------------------
+
+function sseOk() {
+  const frames = [
+    'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: "OK" }, finish_reason: "stop" }] }) + "\n\n",
+    "data: [DONE]\n\n",
+  ];
+  const body = new ReadableStream({
+    start(controller) {
+      for (const frame of frames) controller.enqueue(new TextEncoder().encode(frame));
+      controller.close();
+    },
+  });
+  return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+}
+
+test("H1. collectModelRefs scans top-level and preset modelRoles with thinking suffixes", async () => {
+  const { collectModelRefs } = await import("../src/role-healer.js");
+  const doc = {
+    modelRoles: { default: "glm-start/glm-5.3-flash", slow: "newa/gpt-6-astra:auto", web: "web/tavily" },
+    modelPresets: {
+      default: { modelRoles: { judge: "newa/gemini-3.8-flash-high:auto", commit: "agy/gemini-3.5-flash-lite:minimal" } },
+      fallback: { modelRoles: { plan: "p/m" } },
+    },
+  };
+  const refs = collectModelRefs(doc);
+  const pointers = refs.map((r) => r.pointer).sort();
+  assert.deepEqual(pointers, [
+    "modelPresets/default/modelRoles/commit",
+    "modelPresets/default/modelRoles/judge",
+    "modelPresets/fallback/modelRoles/plan",
+    "modelRoles/default",
+    "modelRoles/slow",
+  ]);
+  const slow = refs.find((r) => r.pointer === "modelRoles/slow");
+  assert.deepEqual([slow.provider, slow.model, slow.thinking], ["newa", "gpt-6-astra", "auto"]);
+  // web roles and non-"provider/model" strings are out of scope
+  assert.ok(!refs.some((r) => r.provider === "web"));
+});
+
+test("H2. applyPointerRef rewrites preset roles surgically and top-level roles via role-manager", async () => {
+  const { applyPointerRef } = await import("../src/role-healer.js");
+  const yml = [
+    "theme: dark",
+    "modelPresets:",
+    "  default:",
+    "    defaultThinkingLevel: auto",
+    "    modelRoles:",
+    "      judge: old/dead:auto",
+    "      keep: same/stays",
+    "modelRoles:",
+    "  default: top/old",
+  ].join("\n");
+  const out = applyPointerRef(applyPointerRef(yml, "modelPresets/default/modelRoles/judge", "glm-start/glm-5.3-flash:auto"), "modelRoles/default", "glm-start/glm-5.3-flash");
+  assert.match(out, /^      judge: glm-start\/glm-5\.3-flash:auto$/m);
+  assert.match(out, /^      keep: same\/stays$/m);
+  assert.match(out, /^  default: glm-start\/glm-5\.3-flash$/m);
+  assert.match(out, /^theme: dark$/m);
+  assert.match(out, /defaultThinkingLevel: auto/);
+  assert.throws(() => applyPointerRef(yml, "modelPresets/nope/modelRoles/judge", "a/b"), /pointer not found/);
+  assert.throws(() => applyPointerRef(yml, "bogus/1/2/3/4", "a/b"), /unsupported model role pointer/);
+});
+
+test("H3. checkModelRefs probes once per distinct provider/model and flags missing providers", async (t) => {
+  const { checkModelRefs } = await import("../src/role-healer.js");
+  const originalFetch = globalThis.fetch;
+  const okModels = new Set(["glm-5.3-flash"]);
+  const probeBodies = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const body = JSON.parse(init.body || "{}");
+    probeBodies.push(body.model);
+    if (okModels.has(body.model)) {
+      return sseOk();
+    }
+    return new Response(JSON.stringify({ error: { message: "model not found" } }), { status: 404 });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const providers = [
+    { name: "glm-start", baseUrl: "http://127.0.0.1:3000/v1", api: "openai-completions", apiKey: "k", models: [{ id: "glm-5.3-flash" }] },
+    { name: "newa", baseUrl: "https://newa.example/v1", api: "openai-completions", apiKey: "k2", models: [{ id: "gpt-6-astra" }] },
+  ];
+  const refs = [
+    { pointer: "modelRoles/default", role: "default", provider: "glm-start", model: "glm-5.3-flash", thinking: null, ref: "glm-start/glm-5.3-flash" },
+    { pointer: "modelRoles/slow", role: "slow", provider: "newa", model: "gpt-6-astra", thinking: "auto", ref: "newa/gpt-6-astra:auto" },
+    { pointer: "modelRoles/judge", role: "judge", provider: "newa", model: "gpt-6-astra", thinking: null, ref: "newa/gpt-6-astra" },
+    { pointer: "modelRoles/tiny", role: "tiny", provider: "ghost", model: "x", thinking: null, ref: "ghost/x" },
+  ];
+  const checked = await checkModelRefs({ refs, providers });
+  // one probe per distinct provider/model, not per role reference
+  assert.deepEqual(probeBodies, ["glm-5.3-flash", "gpt-6-astra"]);
+  assert.equal(checked.find((r) => r.pointer === "modelRoles/default").ok, true);
+  assert.equal(checked.find((r) => r.pointer === "modelRoles/slow").ok, false);
+  assert.equal(checked.find((r) => r.pointer === "modelRoles/judge").ok, false);
+  const ghost = checked.find((r) => r.pointer === "modelRoles/tiny");
+  assert.equal(ghost.ok, false);
+  assert.match(ghost.error, /provider 'ghost' not configured/);
+});
+
+test("H4. healModelRefs replaces failing refs after verified probe and preserves thinking suffix", async (t) => {
+  const { healModelRefs } = await import("../src/role-healer.js");
+  const env = makeTempEnv("omp-heal-");
+  t.after(env.cleanup);
+  const root = env.a.agent;
+  fs.writeFileSync(path.join(root, "config.yml"), [
+    "theme: dark",
+    "modelRoles:",
+    "  slow: newa/gpt-6-astra:auto",
+    "  smol: glm-start/glm-5.3-flash",
+  ].join("\n"), "utf8");
+
+  const originalFetch = globalThis.fetch;
+  let failNext = 0; // first probe call fails (the dead model), later calls succeed
+  globalThis.fetch = async (url, init = {}) => {
+    const body = JSON.parse(init.body || "{}");
+    if (failNext === 0 && body.model === "gpt-6-astra") {
+      failNext = 1;
+      return new Response(JSON.stringify({ error: { message: "insufficient quota" } }), { status: 402 });
+    }
+    return sseOk();
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const providers = [
+    { name: "glm-start", baseUrl: "http://127.0.0.1:3000/v1", api: "openai-completions", apiKey: "k", models: [{ id: "glm-5.3-flash" }] },
+    { name: "newa", baseUrl: "https://newa.example/v1", api: "openai-completions", apiKey: "k2", models: [{ id: "gpt-6-astra" }] },
+  ];
+  const notes = [];
+  const selections = [];
+  const ctx = {
+    ui: {
+      notify: (msg, type) => notes.push({ msg, type }),
+      select: async (title, options) => {
+        selections.push({ title, options });
+        return options[1] ?? options[0]; // pick first candidate ("保留不改" is options[0])
+      },
+    },
+  };
+  const refs = [
+    { pointer: "modelRoles/slow", role: "slow", provider: "newa", model: "gpt-6-astra", thinking: "auto", ref: "newa/gpt-6-astra:auto" },
+    { pointer: "modelRoles/smol", role: "smol", provider: "glm-start", model: "glm-5.3-flash", thinking: null, ref: "glm-start/glm-5.3-flash" },
+  ];
+  const checked = refs.map((r) => ({ ...r, ok: r.provider === "newa" ? false : true, error: r.provider === "newa" ? "HTTP 402" : undefined }));
+  const res = await healModelRefs({ ctx, checked, providers, configPath: path.join(root, "config.yml") });
+
+  assert.equal(res.applied.length, 1);
+  assert.deepEqual(res.applied[0], { pointer: "modelRoles/slow", role: "slow", from: "newa/gpt-6-astra:auto", to: "glm-start/glm-5.3-flash:auto" });
+  const yml = fs.readFileSync(path.join(root, "config.yml"), "utf8");
+  assert.match(yml, /^  slow: glm-start\/glm-5\.3-flash:auto$/m);
+  assert.match(yml, /^  smol: glm-start\/glm-5\.3-flash$/m);
+
+  // Selection dialog offered working candidates (failed ref itself excluded) with "保留不改" escape hatch
+  assert.equal(selections.length, 1);
+  assert.deepEqual(selections[0].options, ["保留不改", "glm-start/glm-5.3-flash"]);
+});
+
+test("H5. healModelRefs keeps original on Esc/no-candidates and never rewrites healthy refs", async (t) => {
+  const { healModelRefs } = await import("../src/role-healer.js");
+  const env = makeTempEnv("omp-heal-keep-");
+  t.after(env.cleanup);
+  const root = env.a.agent;
+  const original = "modelRoles:\n  slow: newa/gpt-6-astra:auto\n";
+  fs.writeFileSync(path.join(root, "config.yml"), original, "utf8");
+
+  const providers = [
+    { name: "newa", baseUrl: "https://newa.example/v1", api: "openai-completions", apiKey: "k2", models: [{ id: "gpt-6-astra" }] },
+  ];
+  const checked = [
+    { pointer: "modelRoles/slow", role: "slow", provider: "newa", model: "gpt-6-astra", thinking: "auto", ref: "newa/gpt-6-astra:auto", ok: false, error: "HTTP 402" },
+  ];
+  let selectCalls = 0;
+  const ctx = {
+    ui: {
+      notify: () => {},
+      select: async () => { selectCalls++; return null; }, // Esc
+    },
+  };
+  const res = await healModelRefs({ ctx, checked, providers, configPath: path.join(root, "config.yml") });
+  // The only configured model is the failed ref itself -> zero candidates, no dialog
+  assert.equal(selectCalls, 0);
+  assert.equal(res.applied.length, 0);
+  assert.equal(res.skipped.length, 1);
+  assert.equal(res.skipped[0].reason, "no replacement candidates configured");
+  assert.equal(fs.readFileSync(path.join(root, "config.yml"), "utf8"), original);
+
+  // With another provider available, Esc on the dialog keeps the original
+  const res3 = await healModelRefs({
+    ctx, checked,
+    providers: [
+      ...providers,
+      { name: "glm-start", baseUrl: "http://127.0.0.1:3000/v1", api: "openai-completions", apiKey: "k", models: [{ id: "glm-5.3-flash" }] },
+    ],
+    configPath: path.join(root, "config.yml"),
+  });
+  assert.equal(selectCalls, 1);
+  assert.equal(res3.applied.length, 0);
+  assert.equal(res3.skipped.length, 1);
+  assert.equal(res3.skipped[0].reason, "user kept original");
+  assert.equal(fs.readFileSync(path.join(root, "config.yml"), "utf8"), original);
+
+  // No candidates at all -> skipped without dialog
+  const res2 = await healModelRefs({
+    ctx, checked, providers: [], configPath: path.join(root, "config.yml"),
+  });
+  assert.equal(selectCalls, 1);
+  assert.equal(res2.applied.length, 0);
+  assert.equal(res2.skipped[0].reason, "no replacement candidates configured");
+});
+
+test("H6. runPullModelHeal end-to-end: healthy config reports all-ok; failing config drives replacement", async (t) => {
+  const { runPullModelHeal } = await import("../src/role-healer.js");
+  const env = makeTempEnv("omp-heal-e2e-");
+  t.after(env.cleanup);
+  const root = env.a.agent;
+  fs.writeFileSync(path.join(root, "models.yml"), [
+    "providers:",
+    "  glm-start:",
+    "    baseUrl: http://127.0.0.1:3000/v1",
+    "    api: openai-completions",
+    "    apiKey: k",
+    "    models:",
+    "      - id: glm-5.3-flash",
+    "        name: glm-5.3-flash",
+    "        input: [text]",
+    "        contextWindow: 1048576",
+    "        maxTokens: 65536",
+    "  deadp:",
+    "    baseUrl: https://dead.example/v1",
+    "    api: openai-completions",
+    "    apiKey: k3",
+    "    models:",
+    "      - id: dead-model",
+    "        name: dead-model",
+    "        input: [text]",
+    "        contextWindow: 1000",
+    "        maxTokens: 100",
+  ].join("\n"), "utf8");
+  fs.writeFileSync(path.join(root, "config.yml"), [
+    "modelRoles:",
+    "  default: glm-start/glm-5.3-flash",
+    "  slow: deadp/dead-model:auto",
+  ].join("\n"), "utf8");
+
+  const originalFetch = globalThis.fetch;
+  let deadProbed = false;
+  globalThis.fetch = async (url, init = {}) => {
+    const body = JSON.parse(init.body || "{}");
+    if (String(url).includes("dead.example")) {
+      deadProbed = true;
+      return new Response(JSON.stringify({ error: { message: "no channel" } }), { status: 503 });
+    }
+    return sseOk();
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const selections = [];
+  const notes = [];
+  const ctx = {
+    ui: {
+      notify: (msg, type) => notes.push({ msg, type }),
+      select: async (title, options) => {
+        selections.push({ title, options });
+        return options[1] ?? options[0];
+      },
+    },
+  };
+  const res = await runPullModelHeal(ctx, { root, notify: (msg, type) => ctx.ui.notify(msg, type) });
+  assert.ok(deadProbed);
+  assert.equal(res.applied.length, 1);
+  assert.equal(res.applied[0].to, "glm-start/glm-5.3-flash:auto");
+  assert.equal(res.checked.length, 2);
+  const yml = fs.readFileSync(path.join(root, "config.yml"), "utf8");
+  assert.match(yml, /^  slow: glm-start\/glm-5\.3-flash:auto$/m);
+  assert.match(yml, /^  default: glm-start\/glm-5\.3-flash$/m);
+  assert.ok(notes.some((n) => n.msg.includes("1 不可用")));
+
+  // Headless host (no ui.select): heal is a no-op null
+  const headless = await runPullModelHeal({ ui: { notify: () => {} } }, { root });
+  assert.equal(headless, null);
+});
