@@ -172,10 +172,12 @@ export async function findWorkingReplacement({ candidates, signal }) {
 }
 
 /**
- * Interactive repair flow over the checked refs. Returns applied rewrites
- * [{ pointer, role, from, to }] and skipped refs; never throws on user abort.
- * All probes inside run with a 10s timeout each, two parallel at most
- * (testModelCandidates contract); the caller surfaces cost notice beforehand.
+ * Unified interactive repair flow over the checked refs. Groups failures by
+ * provider/model: ONE dialog per distinct unavailable model, and the chosen
+ * replacement is applied to EVERY reference of that model in one pass
+ * (identical thinking suffixes share the decision).
+ * Returns applied rewrites [{ pointer, role, from, to }] and skipped refs;
+ * never throws on user abort.
  */
 export async function healModelRefs({ ctx, checked, providers, configPath }) {
   const applied = [];
@@ -183,56 +185,66 @@ export async function healModelRefs({ ctx, checked, providers, configPath }) {
   const failures = checked.filter((r) => !r.ok);
   if (failures.length === 0) return { applied, skipped };
 
+  // Group by distinct unavailable provider/model (thinking suffix is preserved
+  // per-ref at rewrite time, so grouping key is bare provider/model).
+  const groups = new Map();
+  for (const failed of failures) {
+    const key = `${failed.provider}/${failed.model}`;
+    if (!groups.has(key)) groups.set(key, { key, failed, refs: [] });
+    groups.get(key).refs.push(failed);
+  }
+
   ctx.ui.notify(
-    `[pull] 发现 ${failures.length} 个模型引用不可用，将逐一探测候选替代（每个候选 1 次短生成请求，可能产生费用；Esc 可跳过）`,
+    `[pull] 发现 ${groups.size} 个不可用模型（${failures.length} 处引用），每个模型统一选择一次替代（每个候选 1 次短生成请求，可能产生费用；Esc 可跳过）`,
     "info",
   );
 
   const text = fs.readFileSync(configPath, "utf8");
   let updated = text;
 
-  for (const failed of failures) {
+  for (const { key, failed, refs } of groups.values()) {
     const candidates = replacementCandidates({ failedRef: failed, providers });
     if (candidates.length === 0) {
-      skipped.push({ ...failed, reason: "no replacement candidates configured" });
+      for (const ref of refs) skipped.push({ ...ref, reason: "no replacement candidates configured" });
       continue;
     }
 
+    const locations = [...new Set(refs.map((r) => r.pointer))].join(", ");
     const choice = await ctx.ui.select(
-      `模型不可用: ${failed.provider}/${failed.model} (${failed.error}) @ ${failed.pointer}`,
+      `模型不可用: ${key} (${failed.error}) · ${refs.length} 处引用 [${locations}]`,
       ["保留不改", ...candidates.map((c) => c.key)],
-      { outline: true, helpText: "↑↓ 选择 · Enter 确认 · Esc 保留原值" },
+      { outline: true, helpText: "↑↓ 选择 · Enter 确认 · Esc 保留原值 · 所选替代应用到全部引用" },
     );
 
     if (!choice || choice === "保留不改") {
-      skipped.push({ ...failed, reason: "user kept original" });
+      for (const ref of refs) skipped.push({ ...ref, reason: "user kept original" });
       continue;
     }
 
     const chosen = candidates.find((c) => c.key === choice);
     if (!chosen) {
-      skipped.push({ ...failed, reason: `unknown selection: ${choice}` });
+      for (const ref of refs) skipped.push({ ...ref, reason: `unknown selection: ${choice}` });
       continue;
     }
 
-    // Verify the chosen candidate before rewriting (1 short generation).
+    // Verify the chosen candidate once before rewriting (1 short generation).
     const { results } = await testModelCandidates({
       name: chosen.provider,
-      config: {
-        baseUrl: chosen.baseUrl,
-        api: chosen.api,
-        apiKey: chosen.apiKey,
-      },
+      config: { baseUrl: chosen.baseUrl, api: chosen.api, apiKey: chosen.apiKey },
       ids: [chosen.model],
     });
     if (!results.some((r) => r.ok)) {
-      skipped.push({ ...failed, reason: `selected ${chosen.key} failed verification: ${results[0]?.error || "unknown"}` });
+      const detail = `selected ${chosen.key} failed verification: ${results[0]?.error || "unknown"}`;
+      for (const ref of refs) skipped.push({ ...ref, reason: detail });
       continue;
     }
 
-    const nextRef = chosen.key + (failed.thinking ? `:${failed.thinking}` : "");
-    updated = applyPointerRef(updated, failed.pointer, nextRef);
-    applied.push({ pointer: failed.pointer, role: failed.role, from: failed.ref, to: nextRef });
+    // Apply to every reference of this model; group applied by target for summary.
+    for (const ref of refs) {
+      const nextRef = chosen.key + (ref.thinking ? `:${ref.thinking}` : "");
+      updated = applyPointerRef(updated, ref.pointer, nextRef);
+      applied.push({ pointer: ref.pointer, role: ref.role, from: ref.ref, to: nextRef });
+    }
   }
 
   if (applied.length > 0) {

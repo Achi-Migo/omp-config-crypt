@@ -114,12 +114,14 @@ same checks standalone; exit code 1 when any check fails.
 
 After a successful (non-dry-run) pull, every chat-model reference in the restored
 `config.yml` (top-level `modelRoles` and `modelPresets.*.modelRoles`) is probed with one
-short verified generation. Unavailable references trigger an interactive dialog offering
-verified replacement candidates from the configured providers (same provider first, the
-failed model itself excluded; `:thinking` suffixes preserved). Selecting a candidate
-re-verifies it, then rewrites the role in place; `保留不改`/Esc keeps the original and the
-ref is reported as skipped. `web/*` roles are never probed. Headless hosts skip the flow
-with a summary notification.
+short verified generation. Unavailable references are grouped by model: ONE dialog per
+distinct unavailable model offers verified replacement candidates from the configured
+providers (same provider first, the failed model itself excluded), and the chosen
+replacement is applied to EVERY reference of that model in one pass (`:thinking`
+suffixes preserved per reference). Selecting a candidate re-verifies it once, then
+rewrites all affected roles; `保留不改`/Esc keeps the original and the refs are reported
+as skipped. `web/*` roles are never probed. Headless hosts skip the flow with a summary
+notification.
 
 ### Provider control menu
 

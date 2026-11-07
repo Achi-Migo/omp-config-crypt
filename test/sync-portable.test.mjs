@@ -4128,6 +4128,84 @@ test("H4. healModelRefs replaces failing refs after verified probe and preserves
   assert.deepEqual(selections[0].options, ["保留不改", "glm-start/glm-5.3-flash"]);
 });
 
+test("H4b. healModelRefs groups by model: one dialog decides every reference of that model", async (t) => {
+  const { healModelRefs } = await import("../src/role-healer.js");
+  const env = makeTempEnv("omp-heal-batch-");
+  t.after(env.cleanup);
+  const root = env.a.agent;
+  fs.writeFileSync(path.join(root, "config.yml"), [
+    "modelRoles:",
+    "  slow: newa/gpt-6-astra:auto",
+    "  plan: newa/gpt-6-astra:high",
+    "  memory: newa/gpt-6-astra",
+    "  smol: glm-start/glm-5.3-flash",
+    "modelPresets:",
+    "  default:",
+    "    modelRoles:",
+    "      judge: newa/gpt-6-astra:minimal",
+  ].join("\n"), "utf8");
+
+  // No network at all: checked refs are pre-annotated, and the chosen replacement
+  // (glm-start/glm-5.3-flash) would be verified with one probe.
+  const originalFetch = globalThis.fetch;
+  const probeModels = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const body = JSON.parse(init.body || "{}");
+    probeModels.push(body.model);
+    const frames = [
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: "OK" }, finish_reason: "stop" }] }) + "\n\n",
+      "data: [DONE]\n\n",
+    ];
+    const stream = new ReadableStream({ start(c) { for (const f of frames) c.enqueue(new TextEncoder().encode(f)); c.close(); } });
+    return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const providers = [
+    { name: "glm-start", baseUrl: "http://127.0.0.1:3000/v1", api: "openai-completions", apiKey: "k", models: [{ id: "glm-5.3-flash" }] },
+    { name: "newa", baseUrl: "https://newa.example/v1", api: "openai-completions", apiKey: "k2", models: [{ id: "gpt-6-astra" }] },
+  ];
+  const dead = { provider: "newa", model: "gpt-6-astra", ok: false, error: "HTTP 402" };
+  const mk = (pointer, role, thinking) => ({
+    pointer, role, provider: dead.provider, model: dead.model, thinking,
+    ref: `newa/gpt-6-astra${thinking ? ":" + thinking : ""}`, ...dead,
+  });
+  const checked = [
+    mk("modelRoles/slow", "slow", "auto"),
+    mk("modelRoles/plan", "plan", "high"),
+    mk("modelRoles/memory", "memory", null),
+    mk("modelPresets/default/modelRoles/judge", "judge", "minimal"),
+  ];
+  const selections = [];
+  const ctx = {
+    ui: {
+      notify: () => {},
+      select: async (title, options) => { selections.push({ title, options }); return options[1]; },
+    },
+  };
+  const res = await healModelRefs({ ctx, checked, providers, configPath: path.join(root, "config.yml") });
+
+  // ONE dialog for the whole group, even though 4 references exist
+  assert.equal(selections.length, 1);
+  assert.match(selections[0].title, /gpt-6-astra/);
+  assert.match(selections[0].title, /4 处引用/);
+  assert.deepEqual(res.applied.map((a) => a.pointer), [
+    "modelRoles/slow", "modelRoles/plan", "modelRoles/memory", "modelPresets/default/modelRoles/judge",
+  ]);
+  // thinking suffixes preserved per reference
+  assert.deepEqual(res.applied.map((a) => a.to), [
+    "glm-start/glm-5.3-flash:auto", "glm-start/glm-5.3-flash:high", "glm-start/glm-5.3-flash", "glm-start/glm-5.3-flash:minimal",
+  ]);
+  const yml = fs.readFileSync(path.join(root, "config.yml"), "utf8");
+  assert.match(yml, /^  slow: glm-start\/glm-5\.3-flash:auto$/m);
+  assert.match(yml, /^  plan: glm-start\/glm-5\.3-flash:high$/m);
+  assert.match(yml, /^  memory: glm-start\/glm-5\.3-flash$/m);
+  assert.match(yml, /^      judge: glm-start\/glm-5\.3-flash:minimal$/m);
+  assert.match(yml, /^  smol: glm-start\/glm-5\.3-flash$/m);
+  // healthy refs untouched; exactly one verification probe for the chosen model
+  assert.deepEqual(probeModels, ["glm-5.3-flash"]);
+});
+
 test("H5. healModelRefs keeps original on Esc/no-candidates and never rewrites healthy refs", async (t) => {
   const { healModelRefs } = await import("../src/role-healer.js");
   const env = makeTempEnv("omp-heal-keep-");

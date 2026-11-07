@@ -1266,8 +1266,14 @@ export default function (pi) {
           try {
             const heal = await runPullModelHeal(ctx, { root: configRoot(), notify: (msg, type) => ctx.ui.notify(msg, type) });
             if (heal && heal.applied.length > 0) {
+              const byFrom = new Map();
+              for (const a of heal.applied) {
+                const groupKey = a.from.replace(/:[a-z]+$/, "");
+                if (!byFrom.has(groupKey)) byFrom.set(groupKey, { to: a.to.replace(/:[a-z]+$/, ""), count: 0 });
+                byFrom.get(groupKey).count++;
+              }
               ctx.ui.notify(
-                "[pull] 模型替换:\n" + heal.applied.map((a) => `  ${a.pointer}: ${a.from} -> ${a.to}`).join("\n") +
+                "[pull] 模型替换:\n" + [...byFrom.entries()].map(([from, g]) => `  ${from} -> ${g.to} (${g.count} 处)`).join("\n") +
                   "\nrestart omp 生效",
                 "info",
               );
