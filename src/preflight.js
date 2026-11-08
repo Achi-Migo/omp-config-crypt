@@ -6,8 +6,9 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { readSyncPolicy } from "./sync-policy.js";
-import { readSyncState, healSyncMetadata } from "./sync-plan.js";
+import { readSyncPolicy, resolveResourceScope } from "./sync-policy.js";
+import { readSyncState, healSyncMetadata, canonicalHash, SENTINEL_DELETED } from "./sync-plan.js";
+import { inventoryResources, readResource, canonicalResourceValue } from "./sync-resources.js";
 import { resolveNpmCommand } from "./rehydrator.js";
 import { runUpgrade } from "./maintenance.js";
 
@@ -138,6 +139,40 @@ export async function runPreflight({
     }
   } catch (err) {
     checks.push({ id: "metadata", status: "fail", detail: `sync metadata not repairable: ${err.message}` });
+  }
+
+  // local-drift: public resources whose local value no longer matches the baseline
+  // are the seeds of pull conflicts; surface them before a remote pull aborts.
+  try {
+    const policy = readSyncPolicy(root);
+    const state = readSyncState(root);
+    const inventory = inventoryResources(root);
+    const drifted = [];
+    for (const item of inventory) {
+      if (resolveResourceScope(item.id, policy, state, item).scope !== "public") continue;
+      const baselineHash = state.resources?.[item.id]?.hash;
+      if (!baselineHash || baselineHash === SENTINEL_DELETED) continue;
+      const readRes = readResource(root, item.id);
+      if (!readRes) {
+        drifted.push(`${item.id} (missing locally)`);
+        continue;
+      }
+      const localHash = canonicalHash(canonicalResourceValue(item.id, readRes.value, root));
+      if (localHash !== baselineHash) drifted.push(item.id);
+    }
+    const head = drifted.slice(0, 8);
+    const rest = drifted.length - head.length;
+    if (drifted.length === 0) {
+      checks.push({ id: "local-drift", status: "pass", detail: "no public resource drifted from baseline" });
+    } else {
+      checks.push({
+        id: "local-drift",
+        status: "warn",
+        detail: `${drifted.length} public resource(s) locally modified since last sync (may conflict on pull): ${head.join(", ")}${rest > 0 ? `, … +${rest} more` : ""}; run pull --dry-run or push to reconcile`,
+      });
+    }
+  } catch (err) {
+    checks.push({ id: "local-drift", status: "warn", detail: `drift check failed: ${err.message}` });
   }
 
   // node-engine: informational gate against package.json engines (warn only).

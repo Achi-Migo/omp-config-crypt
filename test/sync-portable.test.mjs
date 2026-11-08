@@ -4335,3 +4335,46 @@ test("H6. runPullModelHeal end-to-end: healthy config reports all-ok; failing co
   const headless = await runPullModelHeal({ ui: { notify: () => {} } }, { root });
   assert.equal(headless, null);
 });
+
+test("64. runPreflight warns when public resources drift from baseline", async (t) => {
+  const env = makeTempEnv();
+  t.after(env.cleanup);
+  const root = env.a.agent;
+  const noUpgrade = () => ({ local: "0.0.0", latest: "0.0.0", action: "none", reason: "up to date" });
+
+  // Phase 1: empty environment, no baseline → pass
+  let pf = await runPreflight({ root, upgradeFn: noUpgrade });
+  let drift = pf.checks.find((c) => c.id === "local-drift");
+  assert.equal(drift.status, "pass");
+  assert.equal(pf.ok, true);
+
+  // Phase 2: establish baseline (config.yml + public scope + state hash)
+  fs.writeFileSync(path.join(root, "config.yml"), "modelRoles:\n  advisor: a/model\n", "utf8");
+  await setResourceScope(root, "setting:/modelRoles/advisor", "public");
+  const { blob } = buildArchive(TEST_PASS, root);
+  const payload = decryptTestArchive(blob);
+  const state = readSyncState(root);
+  state.resources = state.resources || {};
+  const archived = payload.resources.find((r) => r.id === "setting:/modelRoles/advisor");
+  state.resources["setting:/modelRoles/advisor"] = { hash: canonicalHash(archived.value) };
+  writeSyncState(root, state);
+  pf = await runPreflight({ root, upgradeFn: noUpgrade });
+  drift = pf.checks.find((c) => c.id === "local-drift");
+  assert.equal(drift.status, "pass");
+  assert.equal(pf.ok, true);
+
+  // Phase 3: drift the value → warn naming the id, but ok stays true
+  fs.writeFileSync(path.join(root, "config.yml"), "modelRoles:\n  advisor: b/model\n", "utf8");
+  pf = await runPreflight({ root, upgradeFn: noUpgrade });
+  drift = pf.checks.find((c) => c.id === "local-drift");
+  assert.equal(drift.status, "warn");
+  assert.match(drift.detail, /1 public resource.*setting:\/modelRoles\/advisor/s);
+  assert.equal(pf.ok, true);
+
+  // Phase 4: revert the value → back to pass
+  fs.writeFileSync(path.join(root, "config.yml"), "modelRoles:\n  advisor: a/model\n", "utf8");
+  pf = await runPreflight({ root, upgradeFn: noUpgrade });
+  drift = pf.checks.find((c) => c.id === "local-drift");
+  assert.equal(drift.status, "pass");
+  assert.equal(pf.ok, true);
+});
