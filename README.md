@@ -1,4 +1,4 @@
-# omp-config-crypt (v0.9.13)
+# omp-config-crypt (v0.9.14)
 
 Universal, zero-repair cross-platform configuration encryption and synchronization engine for `omp` (Oh My Pi).
 

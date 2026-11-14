@@ -39,6 +39,7 @@ import {
   formatSyncReport,
   extractDryRun,
   parseSpec,
+  giteeToken,
   adaptArchive,
   selectPublicResources,
   inspectArchivePayload,
@@ -2143,7 +2144,39 @@ test("33. extractDryRun recognizes independent dry-run tokens and preserves path
   });
   assert.deepEqual(parseSpec("gist:new"), { kind: "gist", id: "new" });
   assert.deepEqual(parseSpec("https://example.com/a.enc"), { kind: "http", url: "https://example.com/a.enc" });
+  // gitee targets mirror gist targets and also drop trailing flags
+  assert.deepEqual(parseSpec("gitee:new"), { kind: "gitee", id: "new" });
+  assert.deepEqual(parseSpec("gitee:3mqlbguvd41re06ihkcaw79 --mode remote"), {
+    kind: "gitee",
+    id: "3mqlbguvd41re06ihkcaw79",
+  });
   assert.throws(() => parseSpec("https://example.com/a.enc --mode remote"), /expected gist/);
+});
+
+test("33b. gitee token store decodes UTF-16 and BOM variants", (t) => {
+  const env = makeTempEnv("omp-gitee-token-");
+  t.after(env.cleanup);
+  const home = path.join(env.base, "home");
+  fs.mkdirSync(home, { recursive: true });
+  const tokenFile = path.join(home, "gitee-token");
+  const token = "0123456789abcdef0123456789abcdef";
+  const prevHome = process.env.OMP_HOME;
+  const prevToken = process.env.OMP_GITEE_TOKEN;
+  const prevGitee = process.env.GITEE_TOKEN;
+  delete process.env.OMP_GITEE_TOKEN;
+  delete process.env.GITEE_TOKEN;
+  process.env.OMP_HOME = home;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.OMP_HOME;
+    else process.env.OMP_HOME = prevHome;
+    if (prevToken !== undefined) process.env.OMP_GITEE_TOKEN = prevToken;
+    if (prevGitee !== undefined) process.env.GITEE_TOKEN = prevGitee;
+  });
+  // PowerShell's Set-Content -Value emits UTF-16LE with a BOM, which must still load.
+  fs.writeFileSync(tokenFile, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(token + "\r\n", "utf16le")]));
+  assert.equal(giteeToken(), token);
+  fs.writeFileSync(tokenFile, token + "\n");
+  assert.equal(giteeToken(), token);
 });
 
 test("34. Sync CLI rejects obsolete rehydrate flags and keeps independent rehydrate help", (t) => {
