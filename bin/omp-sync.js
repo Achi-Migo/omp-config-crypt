@@ -17,6 +17,9 @@ import {
   importEncrypted,
   pullGist,
   pushGist,
+  pushGitee,
+  pullGitee,
+  giteeToken,
   pushHttp,
   pullHttp,
   rollback,
@@ -58,6 +61,8 @@ Commands:
   adapt <srcFile> [out]    Adapt legacy v1/v2 archive to current v3 specification
   push <gist:id|url>       Encrypt and push configs to GitHub Gist or HTTP URL
   pull <gist:id|url>       Download and restore configs from Gist or HTTP URL
+  push gitee:<id|new>      Encrypt and push configs to a Gitee code snippet
+  pull gitee:<id>          Download and restore configs from a Gitee code snippet
                            (-f/--force adopts a differing remote namespace; local
                            policy/state are backed up to .bak first)
                            (--mode remote|local auto-resolves
@@ -101,6 +106,8 @@ Environment Variables:
   OMP_CONFIG_PASS          Passphrase for non-interactive automation
   OMP_CFG_CLOUD_TOKEN      Cloud / GitHub API Token
   GITHUB_TOKEN             Alternative GitHub API Token
+  OMP_GITEE_TOKEN          Gitee access token for gitee:<id> targets
+                           (fallback: ~/.omp/gitee-token, 0600, never synced)
   OMP_CFG_ROOT             Override path to ~/.omp/agent
   OMP_HOME                 Override path to ~/.omp
 `);
@@ -145,6 +152,7 @@ function parseCliArgs(argv) {
       throw new Error(`Flag ${a} is not supported; use the independent 'rehydrate' command instead`);
     } else if (a === "-t" || a === "--token") {
       options.token = args[++i];
+      options.tokenExplicit = true;
     } else if (a === "-r" || a === "--root") {
       options.root = args[++i];
     } else if (a === "-u" || a === "--url") {
@@ -183,6 +191,7 @@ function parseCliArgs(argv) {
       options.pass = a.slice(7);
     } else if (a.startsWith("--token=")) {
       options.token = a.slice(8);
+      options.tokenExplicit = true;
     } else if (a.startsWith("--root=")) {
       options.root = a.slice(7);
     } else if (a.startsWith("--url=")) {
@@ -224,8 +233,17 @@ async function resolvePass(pass) {
   return promptText("Enter passphrase: ");
 }
 
-async function resolveToken(token, required) {
+async function resolveToken(token, kind) {
   if (token) return token;
+  if (kind === "gitee") {
+    const fromStore = giteeToken();
+    if (fromStore) return fromStore;
+    if (!process.stdin.isTTY) {
+      throw new Error("Gitee token required: set OMP_GITEE_TOKEN or write ~/.omp/gitee-token");
+    }
+    return promptText("Enter Gitee access token: ");
+  }
+  const required = kind === "gist";
   if (!required) return null;
   if (!process.stdin.isTTY) {
     throw new Error("Token required: specify --token <token> or set OMP_CFG_CLOUD_TOKEN / GITHUB_TOKEN");
@@ -355,19 +373,27 @@ async function main() {
 
       case "push": {
         if (!options.target) {
-          throw new Error("Usage: omp-sync push <gist:id|new|https://url> [options]");
+          throw new Error("Usage: omp-sync push <gist:id|new|gitee:id|new|https://url> [options]");
         }
         const target = parseSpec(options.target);
         const pass = await resolvePass(options.pass);
-        const token = await resolveToken(options.token, target.kind === "gist");
+        const token = await resolveToken(
+          target.kind === "gitee" && !options.tokenExplicit ? null : options.token,
+          target.kind
+        );
         const res =
           target.kind === "gist"
             ? await pushGist(target.id, pass, root, token)
-            : await pushHttp(target.url, pass, root, token);
+            : target.kind === "gitee"
+              ? await pushGitee(target.id, pass, root, token)
+              : await pushHttp(target.url, pass, root, token);
 
         console.log(`[push] Successfully pushed ${res.files} public resource(s) (${res.bytes} bytes).`);
+        if (res.replacedId) {
+          console.log(`[note] Gitee snippets cannot be updated in place; ${res.replacedId} was replaced — use the new id below`);
+        }
         if (res.url) {
-          console.log(`[url] Gist URL: ${res.url}`);
+          console.log(`[url] ${target.kind === "gitee" ? "Gitee URL" : "Gist URL"}: ${res.url}`);
         }
         if (res.id) {
           console.log(`[id] Gist ID: ${res.id}`);
@@ -377,15 +403,20 @@ async function main() {
 
       case "pull": {
         if (!options.target) {
-          throw new Error("Usage: omp-sync pull <gist:id|https://url> [options]");
+          throw new Error("Usage: omp-sync pull <gist:id|gitee:id|https://url> [options]");
         }
         const target = parseSpec(options.target);
         const pass = await resolvePass(options.pass);
-        const token = await resolveToken(options.token, target.kind === "gist");
+        const token = await resolveToken(
+          target.kind === "gitee" && !options.tokenExplicit ? null : options.token,
+          target.kind
+        );
         const res =
           target.kind === "gist"
             ? await pullGist(target.id, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy, keepLocalRoles: options.keepLocal })
-            : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy, keepLocalRoles: options.keepLocal });
+            : target.kind === "gitee"
+              ? await pullGitee(target.id, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy, keepLocalRoles: options.keepLocal })
+              : await pullHttp(target.url, pass, root, token, { dryRun: options.dryRun, force: options.force, strategy: options.strategy, keepLocalRoles: options.keepLocal });
         if (res.adoptedNamespace) {
           console.log(`[pull] Adopted remote namespace ${res.adoptedNamespace} (--force); prior policy/state saved as .bak`);
         }
@@ -444,7 +475,11 @@ async function main() {
 
       case "doctor": {
         const target = options.target ? parseSpec(options.target) : null;
-        const pf = await runPreflight({ root, target, token: options.token ?? null });
+        const token =
+          target?.kind === "gitee"
+            ? (options.tokenExplicit ? options.token : giteeToken())
+            : (options.token ?? null);
+        const pf = await runPreflight({ root, target, token });
         for (const c of pf.checks) {
           console.log(`[${c.status.toUpperCase()}] ${c.id}: ${c.detail}`);
         }

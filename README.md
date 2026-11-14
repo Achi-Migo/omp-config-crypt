@@ -1,4 +1,4 @@
-# omp-config-crypt (v0.9.6)
+# omp-config-crypt (v0.9.13)
 
 Universal, zero-repair cross-platform configuration encryption and synchronization engine for `omp` (Oh My Pi).
 
@@ -44,6 +44,13 @@ npx omp-config-crypt import my-backup.enc --pass "mysecret"
 
 # Cloud Push (GitHub Gist)
 npx omp-config-crypt push gist:new --pass "mysecret" --token "$GITHUB_TOKEN"
+
+# Cloud Push / Pull (Gitee code snippet, for mainland-China routes)
+# Token: OMP_GITEE_TOKEN, or a 0600 file ~/.omp/gitee-token (never synced)
+npx omp-config-crypt push gitee:new --pass "mysecret"
+npx omp-config-crypt pull gitee:<id> --pass "mysecret" --dry-run
+# Gitee v5 exposes no PATCH on /gists, so `push gitee:<id>` creates a replacement
+# snippet and prints its new id; `push gitee:new` always starts a fresh snippet.
 
 # Cloud Pull (GitHub Gist)
 npx omp-config-crypt pull gist:<id> --pass "mysecret" --token "$GITHUB_TOKEN"
@@ -97,12 +104,15 @@ Configuration exports include the installed `omp-config-crypt` source (excluding
 /config-import <file.enc> [--dry-run]
 /config-push gist:new
 /config-push gist:<id>
+/config-push gitee:new
+/config-push gitee:<id>
 /config-push https://…
 /config-pull gist:<id> [--dry-run] [--force] [--mode remote|local] [--local]
+/config-pull gitee:<id> [--dry-run] [--force] [--mode remote|local] [--local]
 /config-pull https://… [--dry-run] [--force] [--mode remote|local] [--local]
 /config-rollback
 /config-upgrade [--check]
-/config-doctor [gist:<id> | https://…]
+/config-doctor [gist:<id> | gitee:<id> | https://…]
 ```
 
 `/config-pull` (and `omp-sync pull`) runs a preflight before downloading: corrupt sync
@@ -170,6 +180,9 @@ extension files remain eligible for legacy cleanup.
 The generated private loader lives at `~/.omp/agent/extensions/local-models.js`; existing loaders
 and legacy files are not overwritten or removed. Invalid private JSON and public YAML fields
 unsupported by the fixed-field formatter reject writes rather than silently discard configuration.
+Model-level `api` overrides are supported and preserved when saving any provider, including
+mixed-protocol catalogs with `openai-completions` at provider level and `openai-responses` on individual models.
+Run the isolated storage regression checks with `node --test test/provider-store.test.mjs`.
 
 Standalone Responses example:
 `omp-sync provider add gateway --url https://example.com/v1 --key YOUR_KEY --api openai-responses --model MODEL_ID --private --non-interactive`.
@@ -187,6 +200,8 @@ re-verify or restore your configured extensions and sync scripts.
 |---|---|
 | `OMP_CONFIG_PASS` | Encryption/decryption passphrase for headless automation |
 | `OMP_CFG_CLOUD_TOKEN` | Primary Cloud / GitHub API token (gist scope) |
+| `OMP_GITEE_TOKEN` | Gitee access token for `gitee:<id>` targets (fallback: `~/.omp/gitee-token`) |
+| `OMP_GITEE_API` | Override the Gitee API base (default `https://gitee.com/api/v5`; tests/self-host) |
 | `GITHUB_TOKEN` | Fallback GitHub API token |
 | `OMP_CFG_ROOT` | Override path to agent directory (default: `~/.omp/agent`) |
 | `OMP_HOME` | Override path to omp root (default: `~/.omp`) |

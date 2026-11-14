@@ -13,6 +13,7 @@ import { resolveNpmCommand } from "./rehydrator.js";
 import { runUpgrade } from "./maintenance.js";
 
 const GIST_API = "https://api.github.com/gists/";
+const GITEE_API_DEFAULT = "https://gitee.com/api/v5";
 const PROBE_TIMEOUT_MS = 30_000;
 
 function selfPackage() {
@@ -85,6 +86,34 @@ export async function probeGistAccess(id, token, fetchImpl = fetch) {
     return { ok: false, status: res.status, message: `GitHub API ${res.status} while probing the gist` };
   } catch (err) {
     return { ok: false, status: null, message: `api.github.com unreachable: ${err.message}` };
+  }
+}
+
+/**
+ * Probes Gitee snippet readability. Gitee carries credentials as a query
+ * parameter, so the probe mirrors the pull transport exactly.
+ */
+export async function probeGiteeAccess(id, token, fetchImpl = fetch) {
+  if (!token) {
+    return { ok: false, status: null, message: "gitee token missing: set OMP_GITEE_TOKEN or write ~/.omp/gitee-token" };
+  }
+  const base = process.env.OMP_GITEE_API || GITEE_API_DEFAULT;
+  const url = `${base}/gists/${encodeURIComponent(id)}?access_token=${encodeURIComponent(token)}`;
+  try {
+    const res = await fetchImpl(url, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      headers: { accept: "application/json" },
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, status: res.status, message: `Gitee token rejected (${res.status}): check OMP_GITEE_TOKEN scope and owner` };
+    }
+    if (res.status === 404) {
+      return { ok: false, status: res.status, message: "gitee snippet not found (404): wrong id, or this token cannot see it" };
+    }
+    if (res.ok) return { ok: true, status: res.status, message: "gitee snippet accessible" };
+    return { ok: false, status: res.status, message: `Gitee API ${res.status} while probing the snippet` };
+  } catch (err) {
+    return { ok: false, status: null, message: `gitee.com unreachable: ${err.message}` };
   }
 }
 
@@ -252,6 +281,11 @@ export async function runPreflight({
   // remote-access: probe the pull target before spending the real download.
   if (target?.kind === "gist") {
     const probe = await probeGistAccess(target.id, token, doFetch);
+    checks.push(probe.ok
+      ? { id: "remote-access", status: "pass", detail: probe.message }
+      : { id: "remote-access", status: "fail", detail: probe.message });
+  } else if (target?.kind === "gitee") {
+    const probe = await probeGiteeAccess(target.id, token, doFetch);
     checks.push(probe.ok
       ? { id: "remote-access", status: "pass", detail: probe.message }
       : { id: "remote-access", status: "fail", detail: probe.message });

@@ -27,12 +27,14 @@ export {
 import {
   runPreflight,
   probeGistAccess,
+  probeGiteeAccess,
   probeHttpAccess,
 } from "./src/preflight.js";
 
 export {
   runPreflight,
   probeGistAccess,
+  probeGiteeAccess,
   probeHttpAccess,
 };
 import {
@@ -569,6 +571,40 @@ function envToken() {
   return process.env.OMP_CFG_CLOUD_TOKEN || process.env.GITHUB_TOKEN || null;
 }
 
+export const GITEE_API = process.env.OMP_GITEE_API || "https://gitee.com/api/v5";
+
+/**
+ * Gitee access token: OMP_GITEE_TOKEN, then GITEE_TOKEN, then the 0600 file
+ * ~/.omp/gitee-token (outside the agent config root so it never syncs).
+ */
+export function giteeToken() {
+  const fromEnv = process.env.OMP_GITEE_TOKEN || process.env.GITEE_TOKEN || null;
+  if (fromEnv) return fromEnv;
+  const ompHome = process.env.OMP_HOME || path.join(os.homedir(), ".omp");
+  for (const file of [path.join(ompHome, "gitee-token"), path.join(os.homedir(), ".omp", "gitee-token")]) {
+    try {
+      const value = decodeTokenFile(fs.readFileSync(file));
+      if (value) return value;
+    } catch { /* keep looking */ }
+  }
+  return null;
+}
+
+/**
+ * Decodes a token file written by any editor. PowerShell's default
+ * `Set-Content -Value` emits UTF-16LE with a BOM, which would otherwise be read
+ * as NUL-injected garbage and rejected as 401 by the API.
+ */
+function decodeTokenFile(buffer) {
+  let text;
+  if (buffer[0] === 0xff && buffer[1] === 0xfe) text = buffer.subarray(2).toString("utf16le");
+  else if (buffer[0] === 0xfe && buffer[1] === 0xff) text = Buffer.from(buffer.subarray(2)).swap16().toString("utf16le");
+  else if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) text = buffer.subarray(3).toString("utf8");
+  else if (buffer.includes(0)) text = buffer.toString("utf16le");
+  else text = buffer.toString("utf8");
+  return text.replace(/\uFEFF/g, "").trim();
+}
+
 async function askToken(ctx, title, required) {
   const fromEnv = envToken();
   if (fromEnv) return fromEnv;
@@ -636,7 +672,7 @@ async function fetchWithRetry(url, init = {}, attempts = 3) {
 async function gh(token, pathname, init = {}) {
   const res = await fetchWithRetry(`https://api.github.com${pathname}`, {
     ...init,
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(120_000),
     headers: {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${token}`,
@@ -845,6 +881,92 @@ export async function pullGist(id, pass, root = configRoot(), token = envToken()
   return result;
 }
 
+/**
+ * Gitee v5 request. Credentials travel as the access_token parameter (Gitee has
+ * no bearer-token equivalent): query string for reads, form body for writes.
+ */
+async function giteeRequest(pathname, token, init = {}) {
+  const url = new URL(`${GITEE_API}${pathname}`);
+  const method = (init.method || "GET").toUpperCase();
+  const body = init.body instanceof URLSearchParams ? init.body : null;
+  if (method === "GET" || method === "DELETE") {
+    url.searchParams.set("access_token", token);
+    if (body) for (const [key, value] of body) url.searchParams.set(key, value);
+  }
+  const res = await fetchWithRetry(url.toString(), {
+    ...init,
+    method,
+    body: method === "GET" || method === "DELETE" ? undefined : body,
+    signal: AbortSignal.timeout(120_000),
+    headers: {
+      accept: "application/json",
+      ...(body ? { "content-type": "application/x-www-form-urlencoded" } : {}),
+      ...(init.headers || {}),
+    },
+  });
+  if (!res.ok) throw new Error(`Gitee API ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Gitee API returned non-JSON: ${text.slice(0, 200)}`);
+  }
+}
+
+/**
+ * Push the archive to a Gitee code snippet. Gitee exposes no PATCH on /gists,
+ * so an existing id cannot be updated in place: a replacement snippet is
+ * created and its new id reported.
+ */
+export async function pushGitee(id, pass, root = configRoot(), token = giteeToken()) {
+  if (!token) {
+    throw new Error("Gitee token required: set OMP_GITEE_TOKEN or write ~/.omp/gitee-token");
+  }
+  const { blob, files, payload } = buildArchive(pass, root);
+  const form = new URLSearchParams();
+  form.set("access_token", token);
+  form.set("description", "omp config (encrypted)");
+  form.set("public", "false");
+  form.set(`files[${GIST_FILE}][content]`, blob.toString("base64"));
+  const data = await giteeRequest("/gists", token, { method: "POST", body: form });
+
+  try {
+    commitPushBaseline(root, payload);
+  } catch (error) {
+    throw new Error(`Upload succeeded; local baseline commit failed: ${error.message}`);
+  }
+
+  const owner = data?.owner?.login || data?.user?.login;
+  const url = data?.html_url || (owner ? `https://gitee.com/${owner}/codes/${data.id}` : `https://gitee.com/api/v5/gists/${data.id}`);
+  return {
+    id: data.id,
+    url,
+    files,
+    bytes: blob.length,
+    replacedId: id && id !== "new" && id !== data.id ? id : null,
+    contentBytes: blob.toString("base64").length,
+  };
+}
+
+/** Pull the archive from a Gitee code snippet. */
+export async function pullGitee(id, pass, root = configRoot(), token = giteeToken(), options = {}) {
+  if (!token) {
+    throw new Error("Gitee token required: set OMP_GITEE_TOKEN or write ~/.omp/gitee-token");
+  }
+  const preflightChecks = await gatePullPreflight(root, { kind: "gitee", id }, token, options);
+  const data = await giteeRequest(`/gists/${encodeURIComponent(id)}`, token);
+  const entry = data?.files?.[GIST_FILE];
+  if (entry?.truncated) {
+    throw new Error(`gitee gist ${id} truncated ${GIST_FILE}; Gitee limits snippet size — keep the archive under the snippet limit`);
+  }
+  const content = typeof entry === "string" ? entry : entry?.content;
+  if (!content) throw new Error(`gitee gist ${id} has no ${GIST_FILE}`);
+  const blob = Buffer.from(content, "base64");
+  const result = restoreRemoteArchive(blob, pass, root, options);
+  result.preflight = preflightChecks;
+  return result;
+}
+
 /** Push to any endpoint accepting PUT (presigned S3, WebDAV, custom). */
 export async function pushHttp(url, pass, root = configRoot(), token = envToken()) {
   const { blob, files, payload } = buildArchive(pass, root);
@@ -853,7 +975,7 @@ export async function pushHttp(url, pass, root = configRoot(), token = envToken(
   const res = await fetchWithRetry(url, {
     method: "PUT",
     body: blob,
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(120_000),
     headers,
   });
   if (!res.ok) throw new Error(`PUT ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -872,7 +994,7 @@ export async function pushHttp(url, pass, root = configRoot(), token = envToken(
 export async function pullHttp(url, pass, root = configRoot(), token = envToken(), options = {}) {
   const preflightChecks = await gatePullPreflight(root, { kind: "http", url }, token, options);
   const res = await fetchWithRetry(url, {
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(120_000),
     headers: token ? { authorization: `Bearer ${token}` } : {},
   });
   if (!res.ok) throw new Error(`GET ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -885,8 +1007,9 @@ export async function pullHttp(url, pass, root = configRoot(), token = envToken(
 export function parseSpec(spec) {
   const s = String(spec || "").trim();
   if (s.startsWith("gist:")) return { kind: "gist", id: s.slice(5).split(/\s+/)[0] || "new" };
+  if (s.startsWith("gitee:")) return { kind: "gitee", id: s.slice(6).split(/\s+/)[0] || "new" };
   if (/^https?:\/\/\S+$/.test(s)) return { kind: "http", url: s };
-  throw new Error("expected gist:<id|new> or an https URL");
+  throw new Error("expected gist:<id|new>, gitee:<id|new>, or an https URL");
 }
 
 export function extractDryRun(str) {
@@ -1202,7 +1325,7 @@ export default function (pi) {
   });
 
   pi.registerCommand("config-push", {
-    description: "Encrypt and upload public configs to gist:<id|new> or an https URL",
+    description: "Encrypt and upload public configs to gist:<id|new>, gitee:<id|new>, or an https URL",
     handler: async (args, ctx) => {
       const root = configRoot();
       if (typeof ctx?.ui?.askDialog === "function") {
@@ -1211,18 +1334,23 @@ export default function (pi) {
       }
       const spec = (args || "").trim();
       if (!spec) {
-        ctx.ui.notify("usage: /config-push gist:new | gist:<id> | https://…", "error");
+        ctx.ui.notify("usage: /config-push gist:new | gitee:new | gist:<id> | gitee:<id> | https://…", "error");
         return;
       }
       try {
         const target = parseSpec(spec);
         const pass = await askPass(ctx, "Push passphrase");
-        const token = await askToken(ctx, "Cloud token", target.kind === "gist");
+        const token = target.kind === "gitee"
+          ? giteeToken() || await askToken(ctx, "Gitee access token", true)
+          : await askToken(ctx, "Cloud token", target.kind === "gist");
         const r = target.kind === "gist"
           ? await pushGist(target.id, pass, configRoot(), token)
-          : await pushHttp(target.url, pass, configRoot(), token);
+          : target.kind === "gitee"
+            ? await pushGitee(target.id, pass, configRoot(), token)
+            : await pushHttp(target.url, pass, configRoot(), token);
         const where = r.url ? `${r.url} (id ${r.id})` : r.url;
-        ctx.ui.notify(`pushed ${r.files} public resources (${r.bytes} B) → ${where}`, "info");
+        const replaced = r.replacedId ? ` — replaced ${r.replacedId}; use the new id` : "";
+        ctx.ui.notify(`pushed ${r.files} public resources (${r.bytes} B) → ${where}${replaced}`, "info");
       } catch (error) {
         ctx.ui.notify(`config-push failed: ${error?.message ?? error}`, "error");
       }
@@ -1230,7 +1358,7 @@ export default function (pi) {
   });
 
   pi.registerCommand("config-pull", {
-    description: "Download and decrypt config from gist:<id> or an https URL (--dry-run to preview)",
+    description: "Download and decrypt config from gist:<id>, gitee:<id>, or an https URL (--dry-run to preview)",
     handler: async (args, ctx) => {
       const root = configRoot();
       if (typeof ctx?.ui?.askDialog === "function") {
@@ -1239,16 +1367,20 @@ export default function (pi) {
       }
       const { dryRun, force, strategy, keepLocal, clean: spec } = extractDryRun(args || "");
       if (!spec) {
-        ctx.ui.notify("usage: /config-pull gist:<id> | https://… [--dry-run] [--force] [--mode remote|local] [--local]", "error");
+        ctx.ui.notify("usage: /config-pull gist:<id> | gitee:<id> | https://… [--dry-run] [--force] [--mode remote|local] [--local]", "error");
         return;
       }
       try {
         const target = parseSpec(spec);
         const pass = await askPass(ctx, "Pull passphrase");
-        const token = await askToken(ctx, "Cloud token", target.kind === "gist");
+        const token = target.kind === "gitee"
+          ? giteeToken() || await askToken(ctx, "Gitee access token", true)
+          : await askToken(ctx, "Cloud token", target.kind === "gist");
         const r = target.kind === "gist"
           ? await pullGist(target.id, pass, configRoot(), token, { dryRun, force, strategy, keepLocalRoles: keepLocal })
-          : await pullHttp(target.url, pass, configRoot(), token, { dryRun, force, strategy, keepLocalRoles: keepLocal });
+          : target.kind === "gitee"
+            ? await pullGitee(target.id, pass, configRoot(), token, { dryRun, force, strategy, keepLocalRoles: keepLocal })
+            : await pullHttp(target.url, pass, configRoot(), token, { dryRun, force, strategy, keepLocalRoles: keepLocal });
         if (Array.isArray(r.preflight) && r.preflight.length > 0) {
           ctx.ui.notify(
             "[pull] preflight:\n" + r.preflight.map((c) => `  [${c.status.toUpperCase()}] ${c.id}: ${c.detail}`).join("\n"),
@@ -1331,7 +1463,7 @@ export default function (pi) {
   });
 
   pi.registerCommand("config-doctor", {
-    description: "Preflight environment/config checks with self-healing (optional gist:<id> or https target)",
+    description: "Preflight environment/config checks with self-healing (optional gist:<id>, gitee:<id>, or https target)",
     handler: async (args, ctx) => {
       try {
         const spec = String(args || "").trim();
@@ -1339,7 +1471,9 @@ export default function (pi) {
         let token = envToken();
         if (spec) {
           target = parseSpec(spec);
-          const asked = await askToken(ctx, "Cloud token", target.kind === "gist");
+          const asked = target.kind === "gitee"
+            ? giteeToken() || await askToken(ctx, "Gitee access token", false)
+            : await askToken(ctx, "Cloud token", target.kind === "gist");
           if (asked) token = asked;
         }
         const pf = await runPreflight({ root: configRoot(), target, token });
